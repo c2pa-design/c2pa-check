@@ -1,0 +1,4 @@
+{
+  "credential": "absent",
+  "note": "a truncated JUMBF box is not a manifest; the container still reads"
+}

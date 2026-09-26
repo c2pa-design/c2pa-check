@@ -1,0 +1,4 @@
+{
+  "credential": "absent",
+  "note": "65 KB that would inflate to 67 MB; pixels are never decoded, so it verifies normally"
+}

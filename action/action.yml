@@ -1,0 +1,105 @@
+name: c2pa-check
+description: Verify Content Credentials on files and production URLs, and fail the build when provenance disappears.
+author: c2pa.design
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  paths:
+    description: Glob of files to verify, e.g. "public/**/*.{jpg,png,webp}".
+    required: false
+    default: ""
+  urls:
+    description: Newline-separated production URLs to verify after a deploy.
+    required: false
+    default: ""
+  coverage:
+    description: Fail when fewer than this percentage of targets are trusted.
+    required: false
+    default: "100"
+  expect:
+    description: present | trusted | absent
+    required: false
+    default: ""
+  trust:
+    description: official | interim | both | none
+    required: false
+    default: official
+  format:
+    description: text | json | junit
+    required: false
+    default: text
+  version:
+    description: Release of c2pa-check to run.
+    required: false
+    default: latest
+
+outputs:
+  coverage:
+    description: Percentage of targets a verifier would call trusted; empty unless format is text.
+    value: ${{ steps.check.outputs.coverage }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install c2pa-check
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        version="$INPUT_VERSION"
+        if [ "$version" = "latest" ]; then
+          version=$(curl -fsSL https://api.github.com/repos/c2pa-design/c2pa-check/releases/latest | jq -r .tag_name)
+        fi
+        arch=$(uname -m)
+        case "$arch" in
+          x86_64) target=x86_64-unknown-linux-musl ;;
+          aarch64|arm64) target=aarch64-unknown-linux-musl ;;
+          *) echo "unsupported architecture $arch" >&2; exit 1 ;;
+        esac
+        curl -fsSL "https://github.com/c2pa-design/c2pa-check/releases/download/${version}/c2pa-check-${target}.tar.gz" \
+          | tar xz -C /usr/local/bin c2pa-check
+        c2pa-check --version
+
+    - name: Check provenance
+      id: check
+      shell: bash
+      env:
+        INPUT_TRUST: ${{ inputs.trust }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_COVERAGE: ${{ inputs.coverage }}
+        INPUT_EXPECT: ${{ inputs.expect }}
+        INPUT_PATHS: ${{ inputs.paths }}
+        INPUT_URLS: ${{ inputs.urls }}
+      run: |
+        set -uo pipefail
+        args=(--trust "$INPUT_TRUST" --format "$INPUT_FORMAT")
+        if [ -n "$INPUT_COVERAGE" ]; then args+=(--coverage "$INPUT_COVERAGE"); fi
+        if [ -n "$INPUT_EXPECT" ]; then args+=(--expect "$INPUT_EXPECT"); fi
+
+        targets=()
+        if [ -n "$INPUT_PATHS" ]; then targets+=("$INPUT_PATHS"); fi
+        while IFS= read -r url; do
+          [ -n "$url" ] && targets+=("$url")
+        done <<< "$INPUT_URLS"
+
+        if [ ${#targets[@]} -eq 0 ]; then
+          echo "::error::give the action paths or urls"
+          exit 2
+        fi
+
+        c2pa-check "${args[@]}" "${targets[@]}" | tee result.txt
+        status=${PIPESTATUS[0]}
+
+        coverage=""
+        if [ "$INPUT_FORMAT" = "text" ]; then
+          coverage=$(grep -oE 'coverage [0-9.]+' result.txt | tail -1 | awk '{print $2}' || true)
+        fi
+        echo "coverage=$coverage" >> "$GITHUB_OUTPUT"
+
+        if [ "$status" -eq 1 ]; then
+          echo "::error::Content Credentials are missing or untrusted. See the list above."
+        fi
+        exit "$status"

@@ -1,0 +1,24 @@
+[package]
+name = "c2pa-check"
+description = "Verify Content Credentials from the command line and fail a build when provenance disappears."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+default-run = "c2pa-check"
+
+[[bin]]
+name = "c2pa-check"
+path = "src/main.rs"
+
+[dependencies]
+c2pa-check-core = { path = "../c2pa-check-core", version = "0.1.0" }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+glob = "0.3"
+anyhow = "1"
