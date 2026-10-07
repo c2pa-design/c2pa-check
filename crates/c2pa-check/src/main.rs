@@ -321,6 +321,8 @@ mod tests {
                 size_bytes: 1,
                 width: None,
                 height: None,
+                pdq: None,
+                pdq_quality: None,
             },
         );
         r.credential = Credential {

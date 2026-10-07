@@ -103,7 +103,40 @@
         "mime_type": { "type": "string" },
         "size_bytes": { "type": "integer", "minimum": 0 },
         "width": { "type": "integer", "minimum": 0 },
-        "height": { "type": "integer", "minimum": 0 }
+        "height": { "type": "integer", "minimum": 0 },
+        "pdq": {
+          "description": "256-bit PDQ perceptual hash of the decoded raster (JPEG, PNG, WebP), as 64 lowercase hex characters. Absent when the image could not be decoded or is not a raster.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "pdq_quality": {
+          "description": "PDQ quality metric. Below 50 the hash is unreliable for matching.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    "metadata": {
+      "description": "Embedded IPTC/Exif/XMP metadata presence, scored as IPTC Metawatch does. Present for every image media type.",
+      "type": "object",
+      "required": ["four_cs_score", "fields", "digital_source_type", "ai_system_used"],
+      "properties": {
+        "four_cs_score": {
+          "description": "25 each for Creator, Copyright, CaptionDescription and CreditLine.",
+          "type": "integer",
+          "enum": [0, 25, 50, 75, 100]
+        },
+        "fields": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/metawatchField" }
+        },
+        "digital_source_type": {
+          "description": "Last path segment of Iptc4xmpExt:DigitalSourceType from XMP.",
+          "type": ["string", "null"]
+        },
+        "ai_system_used": { "type": ["string", "null"] }
       }
     },
     "raw_manifest_store": { "type": "object" }
@@ -115,6 +148,15 @@
     },
     "sourceCategory": {
       "enum": ["ai-generated", "ai-composite", "ai-enhanced", "algorithmic", "software", "camera", "unknown"]
+    },
+    "metawatchField": {
+      "enum": [
+        "AIPromptInformation", "AIPromptWriterName", "AISystemUsed", "AISystemVersionUsed",
+        "AltTextAccessibility", "CaptionDescription", "Copyright", "Creator", "CreditLine",
+        "DataMining", "DateCreated", "DigitalSourceType", "ExtendedDescriptionAccessibility",
+        "Genre", "Keywords", "LicensorName", "LicensorURL", "LocationCreated", "LocationShown",
+        "ObjectName", "Source", "UsageTerms", "WebStatement"
+      ]
     },
     "validationEntries": {
       "type": "array",

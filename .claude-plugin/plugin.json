@@ -1,0 +1,6 @@
+{
+  "name": "c2pa-check",
+  "description": "Verify and track C2PA Content Credentials on every asset in a repo; offline CLI plus the c2pa.design MCP.",
+  "homepage": "https://c2pa.design/docs/agents",
+  "license": "MIT OR Apache-2.0"
+}

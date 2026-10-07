@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "c2pa-check": { "command": "npx", "args": ["-y", "c2pa-check", "mcp"] }
+  }
+}

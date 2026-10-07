@@ -4,6 +4,8 @@ pub mod digest;
 pub mod error;
 pub mod explain;
 pub mod media;
+pub mod metadata;
+pub mod pdq;
 pub mod report;
 pub mod trust;
 
@@ -14,7 +16,8 @@ use std::sync::Arc;
 
 pub use error::Error;
 pub use report::{
-    Asset, Credential, CredentialStatus, EngineInfo, Report, SourceCategory, TrustSelector,
+    Asset, Credential, CredentialStatus, EngineInfo, Metadata, Report, SourceCategory,
+    TrustSelector,
 };
 pub use trust::TrustBundle;
 
@@ -95,6 +98,26 @@ impl Verifier {
         mime_type: &str,
         options: &Options,
     ) -> Result<Report, Error> {
+        self.verify_against(bytes, mime_type, None, options)
+    }
+
+    pub fn verify_with_manifest(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+        manifest: &[u8],
+        options: &Options,
+    ) -> Result<Report, Error> {
+        self.verify_against(bytes, mime_type, Some(manifest), options)
+    }
+
+    fn verify_against(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+        manifest: Option<&[u8]>,
+        options: &Options,
+    ) -> Result<Report, Error> {
         if bytes.len() as u64 > options.max_bytes {
             return Err(Error::LimitExceeded(format!(
                 "{} bytes exceeds the {} byte limit",
@@ -106,17 +129,28 @@ impl Verifier {
         let format = media::require_format(mime_type)?;
         let dimensions = media::dimensions(bytes, options.max_pixels)?;
 
+        let base_mime = mime_type
+            .split(';')
+            .next()
+            .unwrap_or(mime_type)
+            .trim()
+            .to_string();
+        let perceptual = if matches!(format, "jpeg" | "png" | "webp") && dimensions.is_some() {
+            pdq::hash_bytes(bytes, options.max_pixels)
+        } else {
+            None
+        };
+        let metadata =
+            metadata::applies_to(&base_mime).then(|| metadata::extract(bytes, &base_mime));
+
         let asset = Asset {
             sha256: digest::hex_sha256(bytes),
-            mime_type: mime_type
-                .split(';')
-                .next()
-                .unwrap_or(mime_type)
-                .trim()
-                .to_string(),
+            mime_type: base_mime,
             size_bytes: bytes.len() as u64,
             width: dimensions.map(|(w, _)| w),
             height: dimensions.map(|(_, h)| h),
+            pdq: perceptual.as_ref().map(|p| p.hash.clone()),
+            pdq_quality: perceptual.map(|p| p.quality),
         };
 
         let engine = EngineInfo {
@@ -125,23 +159,38 @@ impl Verifier {
             trust_list_version: self.trust_list_version.clone(),
         };
 
-        match self.read_manifest_store(format, bytes, options.max_manifest_bytes)? {
-            Some(store) => Ok(extract::build(store, engine, asset, options, self.selector)),
-            None => Ok(Report::absent(engine, asset)),
-        }
+        let mut report =
+            match self.read_manifest_store(format, bytes, manifest, options.max_manifest_bytes)? {
+                Some(store) => extract::build(store, engine, asset, options, self.selector),
+                None => Report::absent(engine, asset),
+            };
+        report.metadata = metadata;
+
+        Ok(report)
     }
 
     fn read_manifest_store(
         &self,
         format: &str,
         bytes: &[u8],
+        manifest: Option<&[u8]>,
         max_manifest_bytes: usize,
     ) -> Result<Option<serde_json::Value>, Error> {
-        let reader = match c2pa::Reader::from_shared_context(&self.context)
-            .with_stream(format, Cursor::new(bytes))
-        {
+        let reader = c2pa::Reader::from_shared_context(&self.context);
+        let read = match manifest {
+            Some(data) if data.len() > max_manifest_bytes => {
+                return Err(Error::LimitExceeded(format!(
+                    "remote manifest of {} bytes exceeds the {max_manifest_bytes} byte limit",
+                    data.len()
+                )));
+            }
+            Some(data) => reader.with_manifest_data_and_stream(data, format, Cursor::new(bytes)),
+            None => reader.with_stream(format, Cursor::new(bytes)),
+        };
+        let reader = match read {
             Ok(reader) => reader,
-            Err(c2pa::Error::JumbfNotFound) => return Ok(None),
+            Err(c2pa::Error::JumbfNotFound) if manifest.is_none() => return Ok(None),
+            Err(c2pa::Error::RemoteManifestUrl(url)) => return Err(Error::RemoteManifest(url)),
             Err(err) => return Err(Error::ParseFailed(err.to_string())),
         };
 

@@ -8,6 +8,8 @@ pub enum Error {
     LimitExceeded(String),
     #[error("the asset could not be parsed: {0}")]
     ParseFailed(String),
+    #[error("the manifest store is remote, at {0}")]
+    RemoteManifest(String),
     #[error("trust list: {0}")]
     TrustList(String),
     #[error("io: {0}")]
@@ -20,6 +22,7 @@ impl Error {
             Self::UnsupportedMediaType(_) => "unsupported_media_type",
             Self::LimitExceeded(_) => "limit_exceeded",
             Self::ParseFailed(_) => "parse_failed",
+            Self::RemoteManifest(_) => "remote_manifest",
             Self::TrustList(_) => "trust_list",
             Self::Io(_) => "io",
         }
@@ -35,6 +38,7 @@ mod tests {
             Error::UnsupportedMediaType("application/zip".into()),
             Error::LimitExceeded("too big".into()),
             Error::ParseFailed("truncated".into()),
+            Error::RemoteManifest("https://example.com/m.c2pa".into()),
             Error::TrustList("no anchors".into()),
             Error::Io(std::io::Error::other("disk")),
         ]
@@ -49,6 +53,7 @@ mod tests {
             ),
             (Error::LimitExceeded(String::new()), "limit_exceeded"),
             (Error::ParseFailed(String::new()), "parse_failed"),
+            (Error::RemoteManifest(String::new()), "remote_manifest"),
             (Error::TrustList(String::new()), "trust_list"),
             (Error::Io(std::io::Error::other("x")), "io"),
         ];

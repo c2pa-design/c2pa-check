@@ -50,6 +50,7 @@ pub fn build(
         ingredients,
         validation,
         asset,
+        metadata: None,
         raw_manifest_store: options.include_raw.then_some(store),
     }
 }
@@ -340,6 +341,8 @@ mod tests {
             size_bytes: 3,
             width: None,
             height: None,
+            pdq: None,
+            pdq_quality: None,
         }
     }
 

@@ -1,0 +1,11 @@
+{
+  "name": "c2pa-design",
+  "owner": { "name": "c2pa.design", "url": "https://c2pa.design" },
+  "plugins": [
+    {
+      "name": "c2pa-check",
+      "source": "./",
+      "description": "Verify and track C2PA Content Credentials on every asset in a repo; offline CLI plus the c2pa.design MCP."
+    }
+  ]
+}

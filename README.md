@@ -67,16 +67,6 @@ let report = c2pa_check_core::verify(&bytes, "image/jpeg", &bundle, &Default::de
 println!("{}", report.credential.status.as_str());
 ```
 
-## This directory
-
-Inside the c2pa.design monorepo `cli/` is a **separate git repository**
-(`github.com/c2pa-design/c2pa-check`), ignored by the root `.gitignore`. It never depends on
-anything private; the private `engine/` depends on **it**.
-
-```bash
-cd cli && git init && git remote add origin git@github.com:c2pa-design/c2pa-check.git
-```
-
 ## Licence
 
 MIT OR Apache-2.0. Contributions under DCO, no CLA.

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub use crate::metadata::Metadata;
+
 pub const SCHEMA_VERSION: &str = "1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +95,8 @@ pub struct Report {
     pub ingredients: Vec<Ingredient>,
     pub validation: Validation,
     pub asset: Asset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_manifest_store: Option<serde_json::Value>,
 }
@@ -202,6 +206,10 @@ pub struct Asset {
     pub width: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdq: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdq_quality: Option<u8>,
 }
 
 impl Report {
@@ -225,6 +233,7 @@ impl Report {
             ingredients: Vec::new(),
             validation: Validation::default(),
             asset,
+            metadata: None,
             raw_manifest_store: None,
         }
     }
@@ -290,6 +299,8 @@ mod tests {
                 size_bytes: 1,
                 width: None,
                 height: None,
+                pdq: None,
+                pdq_quality: None,
             },
         );
 
@@ -299,6 +310,9 @@ mod tests {
         assert!(value.get("claim").is_none());
         assert!(value.get("actions").is_none());
         assert!(value.get("raw_manifest_store").is_none());
+        assert!(value.get("metadata").is_none());
+        assert!(value["asset"].get("pdq").is_none());
+        assert!(value["asset"].get("pdq_quality").is_none());
         assert_eq!(value["credential"]["status"], "absent");
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
     }
@@ -317,6 +331,8 @@ mod tests {
                 size_bytes: 1,
                 width: Some(8),
                 height: Some(8),
+                pdq: Some("0".repeat(64)),
+                pdq_quality: Some(42),
             },
         );
 
@@ -324,6 +340,25 @@ mod tests {
         let back: Report = serde_json::from_str(&text).expect("a readable report");
 
         assert_eq!(back.asset.width, Some(8));
+        assert_eq!(back.asset.pdq_quality, Some(42));
+        assert_eq!(back.asset.pdq.as_deref().map(str::len), Some(64));
         assert_eq!(back.credential.status, CredentialStatus::Absent);
+    }
+
+    #[test]
+    fn metadata_serializes_with_explicit_nulls() {
+        let metadata = Metadata {
+            four_cs_score: 25,
+            fields: vec!["Creator".into()],
+            digital_source_type: None,
+            ai_system_used: None,
+        };
+
+        let value = serde_json::to_value(&metadata).expect("serializable metadata");
+
+        assert_eq!(value["four_cs_score"], 25);
+        assert_eq!(value["fields"][0], "Creator");
+        assert!(value["digital_source_type"].is_null());
+        assert!(value.as_object().unwrap().contains_key("ai_system_used"));
     }
 }
