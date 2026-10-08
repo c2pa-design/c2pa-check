@@ -29,3 +29,22 @@ jobs:
         with:
           name: c2pa-check-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/c2pa-check*
+
+  npm:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - run: node npm/publish.mjs dist "${GITHUB_REF_NAME#v}" --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
