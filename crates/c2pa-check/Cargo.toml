@@ -14,7 +14,7 @@ name = "c2pa-check"
 path = "src/main.rs"
 
 [dependencies]
-c2pa-check-core = { path = "../c2pa-check-core", version = "0.1.4" }
+c2pa-check-core = { path = "../c2pa-check-core", version = "0.1.5" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 serde.workspace = true
