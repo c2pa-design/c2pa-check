@@ -105,7 +105,7 @@
         "width": { "type": "integer", "minimum": 0 },
         "height": { "type": "integer", "minimum": 0 },
         "pdq": {
-          "description": "256-bit PDQ perceptual hash of the decoded raster (JPEG, PNG, WebP), as 64 lowercase hex characters. Absent when the image could not be decoded or is not a raster.",
+          "description": "256-bit PDQ perceptual hash of the decoded raster (JPEG, PNG, WebP, GIF; AVIF and HEIC where the engine decodes them), alpha-composited onto white, as 64 lowercase hex characters. For an animated image, the first kept frame. Absent when the image could not be decoded or is not a raster.",
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
         },
@@ -114,6 +114,24 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 100
+        },
+        "pdq_black": {
+          "description": "PDQ of the image alpha-composited onto black. Present only when a pixel is not fully opaque.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "pdq_mirrors": {
+          "description": "PDQ of the horizontal and the vertical mirror, derived from the same DCT. Used to probe for mirrored copies.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        },
+        "pdq_frames": {
+          "description": "Animated images only: PDQ of up to 16 kept frames (about one per second of frame time, near-duplicates and frames below quality 50 dropped).",
+          "type": "array",
+          "maxItems": 16,
+          "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         }
       }
     },

@@ -44,6 +44,41 @@ Exit codes: `0` pass · `1` expectation or coverage failed · `2` usage · `3` u
 Add `urls:` to check what your CDN actually serves after a deploy — that is where credentials
 usually disappear.
 
+## Keep the credential through conversion
+
+Re-encoding, resizing or compressing a file drops its manifest, and copying the old manifest back
+does not help: the signature covers the old bytes. `carry` writes a new manifest into the
+converted copy with the original as its `parentOf` ingredient, so the chain back to the
+generator survives.
+
+```bash
+npx -y c2pa-check carry --from hero.png --to hero.webp            # one pair, in place
+npx -y c2pa-check carry 'public/**/*.{webp,avif}' --from-dir src/  # pairs by file name
+c2pa-check carry --from clip.mov --to clip.mp4 --force            # non-picture media
+c2pa-check keygen --out-dir .c2pa                                  # cert.pem + key.pem for CI
+```
+
+| Signer (first that is set) | Signed as | Verifies as |
+|---|---|---|
+| `C2PA_SIGN_CERT` + `C2PA_SIGN_KEY` (PEM, a path, or `*_FILE`) | your certificate | `valid_trusted` if your CA is on the C2PA trust list |
+| `C2PA_DESIGN_API_KEY` (or `C2PA_API_KEY`) | "<your verified domain> via c2pa.design" | `valid_untrusted` |
+| nothing | a local key in `~/.config/c2pa-check/identity` | `valid_untrusted` |
+
+Pictures are compared first (PDQ distance ≤ 31); a different picture or an original without a
+credential is refused with exit `1`. With an API key, c2pa.design checks the carry again and
+signs only an honest one; if hosted signing is unavailable, `carry` signs locally and warns.
+Never `COPY` or `ARG` a key into a Docker image: use `RUN --mount=type=secret`.
+
+## For AI agents
+
+The agent skill lives in [c2pa-design/skills](https://github.com/c2pa-design/skills):
+
+```bash
+npx skills add c2pa-design/skills
+```
+
+MCP only: `claude mcp add c2pa-check -- npx -y c2pa-check mcp`.
+
 ## How trust works
 
 A signature proves the bytes have not changed since signing. It says nothing about *who*
@@ -69,7 +104,7 @@ println!("{}", report.credential.status.as_str());
 
 ## Licence
 
-MIT OR Apache-2.0. Contributions under DCO, no CLA.
+[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). Contributions under DCO, no CLA.
 
 ---
 

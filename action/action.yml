@@ -30,6 +30,14 @@ inputs:
     description: text | json | junit
     required: false
     default: text
+  carry:
+    description: "true to carry Content Credentials from originals in from-dir into the converted files matched by paths before checking."
+    required: false
+    default: "false"
+  from-dir:
+    description: Folder of signed originals, paired with the converted files by file name (with carry).
+    required: false
+    default: ""
   version:
     description: Release of c2pa-check to run.
     required: false
@@ -62,6 +70,32 @@ runs:
         curl -fsSL "https://github.com/c2pa-design/c2pa-check/releases/download/${version}/c2pa-check-${target}.tar.gz" \
           | tar xz -C /usr/local/bin c2pa-check
         c2pa-check --version
+
+    - name: Carry Content Credentials
+      if: ${{ inputs.carry == 'true' }}
+      shell: bash
+      env:
+        INPUT_PATHS: ${{ inputs.paths }}
+        INPUT_FROM_DIR: ${{ inputs.from-dir }}
+      run: |
+        set -uo pipefail
+        if [ -z "$INPUT_PATHS" ] || [ -z "$INPUT_FROM_DIR" ]; then
+          echo "::error::carry needs paths and from-dir"
+          exit 2
+        fi
+        c2pa-check carry "$INPUT_PATHS" --from-dir "$INPUT_FROM_DIR" --json > carry.json
+        status=$?
+        {
+          echo "### Content Credentials carried"
+          echo
+          echo "| File | Outcome | Signer | Status |"
+          echo "|---|---|---|---|"
+          jq -r '(if type == "array" then .[] else . end) | "| \(.derived) | \(.outcome) | \(.signer // "") | \(.status // .message // "") |"' carry.json
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$status" -ne 0 ]; then
+          echo "::error::carry failed or was refused for at least one file. See the job summary."
+        fi
+        exit "$status"
 
     - name: Check provenance
       id: check

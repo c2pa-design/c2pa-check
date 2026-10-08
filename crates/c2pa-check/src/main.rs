@@ -1,3 +1,4 @@
+mod carry_cmd;
 mod fetch;
 mod mcp;
 mod output;
@@ -67,6 +68,23 @@ enum Command {
         shell: clap_complete::Shell,
     },
     Mcp,
+    #[command(
+        about = "Carry a Content Credential from a signed original into a converted copy",
+        long_about = "Carry a Content Credential from a signed original into a converted copy \
+(resized, re-encoded, compressed). The copy gets a new manifest with the original as its \
+parentOf ingredient and c2pa.transcoded / c2pa.resized actions, so the chain back to the \
+generator survives the conversion.\n\nSigner, in order: C2PA_SIGN_CERT + C2PA_SIGN_KEY (your \
+certificate, or *_FILE paths); C2PA_DESIGN_API_KEY (signs as your organization via \
+c2pa.design, falls back to a local key if unavailable); otherwise a local key kept in \
+~/.config/c2pa-check/identity.\n\nExit codes: 0 carried and verified, 1 refused (not the \
+same picture, no credential in the original, or c2pa.design refused the carry), 2 usage or \
+I/O error."
+    )]
+    Carry(carry_cmd::CarryArgs),
+    #[command(
+        about = "Write a certificate chain and private key for C2PA_SIGN_CERT / C2PA_SIGN_KEY"
+    )]
+    Keygen(carry_cmd::KeygenArgs),
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -126,6 +144,13 @@ fn run(mut cli: Cli) -> anyhow::Result<u8> {
         Some(Command::Trust { action }) => return trust_cmd::run(action, cli.offline),
         Some(Command::Mcp) => return mcp::serve(load_bundle(&cli)?),
         Some(Command::Inspect { target, json }) => return inspect(&cli, &target, json),
+        Some(Command::Keygen(args)) => return carry_cmd::keygen(args),
+        Some(Command::Carry(args)) => {
+            let bundle = load_bundle(&cli)?;
+            let verifier = verifier_for(&bundle, cli.trust.into())?;
+
+            return carry_cmd::run(args, &verifier);
+        }
         None => {}
     }
 
@@ -241,15 +266,20 @@ fn expand(targets: &[String]) -> anyhow::Result<Vec<String>> {
     let mut out = Vec::new();
 
     for target in targets {
-        if is_url(target) || !target.contains(['*', '?', '[']) {
+        if is_url(target) || !target.contains(['*', '?', '[', '{']) {
             out.push(target.clone());
 
             continue;
         }
 
         let before = out.len();
-        for entry in glob::glob(target)? {
-            out.push(entry?.to_string_lossy().to_string());
+        for pattern in braces(target) {
+            for entry in glob::glob(&pattern)? {
+                let path = entry?;
+                if path.is_file() {
+                    out.push(path.to_string_lossy().to_string());
+                }
+            }
         }
         if out.len() == before {
             anyhow::bail!("{target} matched no files");
@@ -257,6 +287,27 @@ fn expand(targets: &[String]) -> anyhow::Result<Vec<String>> {
     }
 
     Ok(out)
+}
+
+fn braces(pattern: &str) -> Vec<String> {
+    let Some(open) = pattern.find('{') else {
+        return vec![pattern.to_string()];
+    };
+    let Some(len) = pattern[open..].find('}') else {
+        return vec![pattern.to_string()];
+    };
+    let close = open + len;
+
+    pattern[open + 1..close]
+        .split(',')
+        .flat_map(|alt| {
+            braces(&format!(
+                "{}{alt}{}",
+                &pattern[..open],
+                &pattern[close + 1..]
+            ))
+        })
+        .collect()
 }
 
 fn meets_expectations(
@@ -323,6 +374,7 @@ mod tests {
                 height: None,
                 pdq: None,
                 pdq_quality: None,
+                ..Asset::default()
             },
         );
         r.credential = Credential {
@@ -343,6 +395,40 @@ mod tests {
             .enumerate()
             .map(|(i, s)| (format!("f{i}.jpg"), Some(report(*s))))
             .collect()
+    }
+
+    #[test]
+    fn braces_expand_every_alternative() {
+        assert_eq!(
+            braces("dist/**/*.{jpg,png}"),
+            ["dist/**/*.jpg", "dist/**/*.png"]
+        );
+        assert_eq!(
+            braces("{a,b}/x.{c,d}"),
+            ["a/x.c", "a/x.d", "b/x.c", "b/x.d"]
+        );
+        assert_eq!(braces("plain/*.jpg"), ["plain/*.jpg"]);
+        assert_eq!(braces("open{a,b"), ["open{a,b"]);
+    }
+
+    #[test]
+    fn expand_matches_brace_globs_and_skips_directories() {
+        let dir = std::env::temp_dir().join(format!("c2pa-check-expand-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("nested.jpg")).unwrap();
+        for name in ["a.jpg", "b.png", "c.txt"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let root = dir.to_string_lossy();
+
+        let mut got = expand(&[format!("{root}/*.{{jpg,png}}")]).unwrap();
+        got.sort();
+        let all = expand(&[format!("{root}/*")]).unwrap();
+        let none = expand(&[format!("{root}/*.{{gif,avif}}")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(got, [format!("{root}/a.jpg"), format!("{root}/b.png")]);
+        assert_eq!(all.len(), 3);
+        assert!(none.is_err());
     }
 
     #[test]

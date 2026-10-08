@@ -340,6 +340,7 @@ mod tests {
                 height: None,
                 pdq: None,
                 pdq_quality: None,
+                ..Asset::default()
             },
         );
         report.credential = Credential {

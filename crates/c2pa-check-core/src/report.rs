@@ -197,7 +197,7 @@ pub struct ValidationEntry {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Asset {
     pub sha256: String,
     pub mime_type: String,
@@ -210,6 +210,12 @@ pub struct Asset {
     pub pdq: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdq_quality: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdq_black: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pdq_mirrors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pdq_frames: Vec<String>,
 }
 
 impl Report {
@@ -301,6 +307,7 @@ mod tests {
                 height: None,
                 pdq: None,
                 pdq_quality: None,
+                ..Asset::default()
             },
         );
 
@@ -313,6 +320,9 @@ mod tests {
         assert!(value.get("metadata").is_none());
         assert!(value["asset"].get("pdq").is_none());
         assert!(value["asset"].get("pdq_quality").is_none());
+        assert!(value["asset"].get("pdq_black").is_none());
+        assert!(value["asset"].get("pdq_mirrors").is_none());
+        assert!(value["asset"].get("pdq_frames").is_none());
         assert_eq!(value["credential"]["status"], "absent");
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
     }
@@ -333,6 +343,7 @@ mod tests {
                 height: Some(8),
                 pdq: Some("0".repeat(64)),
                 pdq_quality: Some(42),
+                ..Asset::default()
             },
         );
 

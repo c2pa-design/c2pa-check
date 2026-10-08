@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use image::ImageReader;
+use image::{ImageFormat, ImageReader};
 
 use crate::error::Error;
 
@@ -8,6 +8,7 @@ const SUPPORTED: &[(&str, &str)] = &[
     ("image/jpeg", "jpeg"),
     ("image/png", "png"),
     ("image/webp", "webp"),
+    ("image/gif", "gif"),
     ("image/avif", "avif"),
     ("image/heic", "heic"),
     ("image/heif", "heif"),
@@ -21,8 +22,12 @@ const SUPPORTED: &[(&str, &str)] = &[
     ("application/c2pa", "c2pa"),
 ];
 
+pub fn base_type(mime: &str) -> &str {
+    mime.split(';').next().unwrap_or(mime).trim()
+}
+
 pub fn format_for(mime: &str) -> Option<&'static str> {
-    let base = mime.split(';').next().unwrap_or(mime).trim();
+    let base = base_type(mime);
 
     SUPPORTED
         .iter()
@@ -41,6 +46,7 @@ pub fn mime_from_extension(name: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "webp" => "image/webp",
+        "gif" => "image/gif",
         "avif" => "image/avif",
         "heic" => "image/heic",
         "heif" => "image/heif",
@@ -60,7 +66,7 @@ pub fn dimensions(bytes: &[u8], max_pixels: u64) -> Result<Option<(u32, u32)>, E
     let Ok(reader) = ImageReader::new(Cursor::new(bytes)).with_guessed_format() else {
         return Ok(None);
     };
-    let Ok((width, height)) = reader.into_dimensions() else {
+    let Some((width, height)) = header_dimensions(reader, bytes) else {
         return Ok(None);
     };
 
@@ -71,6 +77,24 @@ pub fn dimensions(bytes: &[u8], max_pixels: u64) -> Result<Option<(u32, u32)>, E
     }
 
     Ok(Some((width, height)))
+}
+
+fn header_dimensions(reader: ImageReader<Cursor<&[u8]>>, bytes: &[u8]) -> Option<(u32, u32)> {
+    if reader.format() == Some(ImageFormat::Avif) {
+        return avif_dimensions(bytes);
+    }
+
+    reader.into_dimensions().ok()
+}
+
+#[cfg(feature = "avif")]
+fn avif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    crate::av1::coded_size(bytes).map(|size| (size.width, size.height))
+}
+
+#[cfg(not(feature = "avif"))]
+fn avif_dimensions(_: &[u8]) -> Option<(u32, u32)> {
+    None
 }
 
 #[cfg(test)]
@@ -126,7 +150,7 @@ mod tests {
     fn refuses_media_types_no_parser_handles() {
         assert!(require_format("application/zip").is_err());
         assert!(require_format("").is_err());
-        assert!(require_format("image/gif").is_err());
+        assert!(require_format("image/bmp").is_err());
     }
 
     #[test]
@@ -134,6 +158,7 @@ mod tests {
         assert_eq!(require_format("image/jpeg").unwrap(), "jpeg");
         assert_eq!(require_format("application/pdf").unwrap(), "pdf");
         assert_eq!(require_format("video/mp4").unwrap(), "mp4");
+        assert_eq!(require_format("image/gif").unwrap(), "gif");
     }
 
     #[test]
@@ -162,8 +187,8 @@ mod tests {
     #[test]
     fn every_guessed_type_is_a_type_the_reader_accepts() {
         for name in [
-            "a.jpg", "a.png", "a.webp", "a.avif", "a.heic", "a.tif", "a.svg", "a.mp4", "a.mov",
-            "a.mp3", "a.wav", "a.pdf", "a.c2pa",
+            "a.jpg", "a.png", "a.webp", "a.gif", "a.avif", "a.heic", "a.tif", "a.svg", "a.mp4",
+            "a.mov", "a.mp3", "a.wav", "a.pdf", "a.c2pa",
         ] {
             let mime = mime_from_extension(name);
 

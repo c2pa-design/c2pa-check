@@ -1,4 +1,7 @@
+#[cfg(feature = "avif")]
+mod av1;
 pub mod calendar;
+pub mod carry;
 pub mod classify;
 pub mod digest;
 pub mod error;
@@ -14,6 +17,7 @@ mod extract;
 use std::io::Cursor;
 use std::sync::Arc;
 
+pub use c2pa;
 pub use error::Error;
 pub use report::{
     Asset, Credential, CredentialStatus, EngineInfo, Metadata, Report, SourceCategory,
@@ -129,17 +133,8 @@ impl Verifier {
         let format = media::require_format(mime_type)?;
         let dimensions = media::dimensions(bytes, options.max_pixels)?;
 
-        let base_mime = mime_type
-            .split(';')
-            .next()
-            .unwrap_or(mime_type)
-            .trim()
-            .to_string();
-        let perceptual = if matches!(format, "jpeg" | "png" | "webp") && dimensions.is_some() {
-            pdq::hash_bytes(bytes, options.max_pixels)
-        } else {
-            None
-        };
+        let base_mime = media::base_type(mime_type).to_string();
+        let print = pdq::fingerprint(bytes, format, options.max_pixels);
         let metadata =
             metadata::applies_to(&base_mime).then(|| metadata::extract(bytes, &base_mime));
 
@@ -149,8 +144,11 @@ impl Verifier {
             size_bytes: bytes.len() as u64,
             width: dimensions.map(|(w, _)| w),
             height: dimensions.map(|(_, h)| h),
-            pdq: perceptual.as_ref().map(|p| p.hash.clone()),
-            pdq_quality: perceptual.map(|p| p.quality),
+            pdq: print.pdq.as_ref().map(|p| p.hash.clone()),
+            pdq_quality: print.pdq.as_ref().map(|p| p.quality),
+            pdq_black: print.black,
+            pdq_mirrors: print.mirrors,
+            pdq_frames: print.frames,
         };
 
         let engine = EngineInfo {
