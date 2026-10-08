@@ -34,7 +34,14 @@ const published = (name) => {
 const publish = (dir) => {
   const { name } = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
   if (published(name)) return console.log(`${name}@${version} already published, skipping`);
-  execFileSync("npm", ["publish", "--access", "public", ...npmArgs], { cwd: dir, stdio: "inherit" });
+  try {
+    execFileSync("npm", ["publish", "--access", "public", ...npmArgs], { cwd: dir, stdio: ["inherit", "inherit", "pipe"] });
+  } catch (e) {
+    const err = String(e.stderr);
+    process.stderr.write(err);
+    if (!/previously (staged|published)/.test(err)) throw e;
+    console.log(`${name}@${version} already on the registry, skipping`);
+  }
 };
 
 const optional = {};
