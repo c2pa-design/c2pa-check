@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 
@@ -24,7 +24,18 @@ const common = {
 const out = "npm-out";
 rmSync(out, { recursive: true, force: true });
 
-const publish = (dir) => execFileSync("npm", ["publish", "--access", "public", ...npmArgs], { cwd: dir, stdio: "inherit" });
+const published = (name) => {
+  try {
+    return execFileSync("npm", ["view", `${name}@${version}`, "version"], { encoding: "utf8" }).trim() === version;
+  } catch {
+    return false;
+  }
+};
+const publish = (dir) => {
+  const { name } = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+  if (published(name)) return console.log(`${name}@${version} already published, skipping`);
+  execFileSync("npm", ["publish", "--access", "public", ...npmArgs], { cwd: dir, stdio: "inherit" });
+};
 
 const optional = {};
 for (const [target, [os, cpu]] of Object.entries(targets)) {
