@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "c2pa-check"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "c2pa-check-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "c2pa",
  "getrandom 0.3.4",
