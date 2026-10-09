@@ -4,7 +4,7 @@ use c2pa_check_core::report::TrustSelector;
 use c2pa_check_core::{Options, TrustBundle, Verifier};
 use serde_json::{json, Value};
 
-const PROTOCOL_VERSION: &str = "2026-07-28";
+const PROTOCOL_VERSIONS: [&str; 4] = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
 
 pub struct Server {
     bundle: TrustBundle,
@@ -58,7 +58,7 @@ pub fn serve(bundle: TrustBundle) -> anyhow::Result<u8> {
         }
 
         let response = match method {
-            "initialize" => ok(id, initialize()),
+            "initialize" => ok(id, initialize(&request)),
             "tools/list" => ok(id, tools()),
             "tools/call" => match call(&request, &server) {
                 Ok(result) => ok(id, result),
@@ -94,9 +94,19 @@ fn tool_error(message: &str) -> Value {
     json!({ "isError": true, "content": [{ "type": "text", "text": message }] })
 }
 
-fn initialize() -> Value {
+fn negotiate(requested: Option<&str>) -> &'static str {
+    PROTOCOL_VERSIONS
+        .into_iter()
+        .find(|v| Some(*v) == requested)
+        .unwrap_or(PROTOCOL_VERSIONS[0])
+}
+
+fn initialize(request: &Value) -> Value {
+    let requested = request
+        .pointer("/params/protocolVersion")
+        .and_then(Value::as_str);
     json!({
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": negotiate(requested),
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "c2pa-check", "version": env!("CARGO_PKG_VERSION") }
     })
@@ -189,4 +199,34 @@ fn content(value: Value) -> Value {
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
         "structuredContent": value
     })
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    fn answered(request: Value) -> Value {
+        initialize(&request)["protocolVersion"].clone()
+    }
+
+    #[test]
+    fn a_supported_version_is_echoed() {
+        for version in PROTOCOL_VERSIONS {
+            let request = json!({"method": "initialize", "params": {"protocolVersion": version}});
+            assert_eq!(answered(request), version);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_missing_version_gets_the_latest() {
+        assert_eq!(
+            answered(json!({"params": {"protocolVersion": "2024-11-05"}})),
+            "2026-07-28"
+        );
+        assert_eq!(
+            answered(json!({"params": {"protocolVersion": 7}})),
+            "2026-07-28"
+        );
+        assert_eq!(answered(json!({"method": "initialize"})), "2026-07-28");
+    }
 }

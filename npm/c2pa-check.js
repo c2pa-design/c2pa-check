@@ -10,6 +10,6 @@ try {
   console.error(`c2pa-check: no prebuilt binary for ${process.platform}-${process.arch}; use cargo install c2pa-check`);
   process.exit(2);
 }
-const r = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+const r = spawnSync(bin, process.argv.slice(2), { stdio: "inherit", env: { ...process.env, C2PA_CHECK_NODE_VERSION: process.versions.node } });
 if (r.error) throw r.error;
 process.exit(r.status ?? 1);

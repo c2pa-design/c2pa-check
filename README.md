@@ -26,10 +26,43 @@ c2pa-check photo.jpg --format json | jq .result.credential.status
 c2pa-check inspect photo.jpg                              # manifest tree
 c2pa-check trust status                                   # which list judged it
 c2pa-check mcp                                            # stdio MCP server
+c2pa-check 'dist/**/*.jpg' --format junit --output c2pa-check.xml  # report to a file
+c2pa-check doctor                                         # key, quota, network, webhook secret, Node
 ```
 
-Exit codes: `0` pass · `1` expectation or coverage failed · `2` usage · `3` unreadable asset ·
-`4` network.
+`--format text|json|ndjson|junit` (default `text`) and `--output PATH` (default: stdout) apply
+to the check command. JUnit marks every target that is not `valid_trusted` as a failure.
+
+| Exit | Meaning |
+|---|---|
+| `0` | pass |
+| `1` | expectation or coverage failed · `doctor` found a failing check · `carry --strict` found an unpaired file |
+| `2` | usage or I/O error |
+| `3` | unreadable asset (missing or unreadable local file, over 64 MiB, malformed manifest) |
+| `4` | a URL could not be fetched |
+| `5` | `carry` refused (rule in `--json`) |
+
+## Check your setup
+
+```console
+$ npx -y c2pa-check doctor
+ok    api_key         live key c2pa_live_AbC…
+ok    network         https://api.c2pa.design/v1 answered HTTP 200
+ok    whoami          live key, organization Acme, plan team, signatures 940 of 1000 left until 2026-11-01
+ok    webhook_secret  valid (whsec_ + base64)
+ok    node            Node.js 22.11.0
+```
+
+| Check | Reads | Fails when |
+|---|---|---|
+| `api_key` | `C2PA_API_KEY` (deprecated fallback `C2PA_DESIGN_API_KEY`) | not `c2pa_live_` / `c2pa_test_` + 32 letters and digits (unset is a warning) |
+| `network` | `C2PA_API_BASE` (deprecated fallback `C2PA_DESIGN_API_URL`, default `https://api.c2pa.design/v1`) | no HTTP answer |
+| `whoami` | `GET {C2PA_API_BASE}/whoami` | the key is refused; an exhausted quota is a warning |
+| `webhook_secret` | `C2PA_WEBHOOK_SECRET` | not `whsec_` + standard base64 (unset is skipped) |
+| `node` | the Node.js running `npx` | older than 18 |
+
+`doctor --json` prints `{ok, api_base, checks: [{name, state, detail, data?}]}` with `state`
+`ok | warn | fail | skip`; the `whoami` check carries the API answer in `data`.
 
 ## In CI
 
@@ -39,7 +72,20 @@ Exit codes: `0` pass · `1` expectation or coverage failed · `2` usage · `3` u
     paths: "public/**/*.{jpg,png,webp}"
     coverage: 100
     format: junit
+    output: c2pa-check.xml
 ```
+
+The action installs the release named by `version` (default `v0.2.0`) and checks it against the
+release's `SHA256SUMS` before running it. Every release publishes `SHA256SUMS` and a GitHub
+build-provenance attestation (`gh attestation verify c2pa-check-<target>.tar.gz -R
+c2pa-design/c2pa-check`); the npm packages are published with npm provenance
+(`npm audit signatures`).
+
+Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.2.0`
+(`node:22-bookworm-slim` is the smallest that also has the glibc tools most pipelines expect;
+the binary itself is static musl, so `node:22-alpine` works too). Pin the version so `npx` hits
+its cache instead of resolving `latest` on every run, and cache `~/.npm` between jobs; or skip
+Node entirely and download the static binary from the release.
 
 Add `urls:` to check what your CDN actually serves after a deploy — that is where credentials
 usually disappear.
@@ -56,18 +102,49 @@ npx -y c2pa-check carry --from hero.png --to hero.webp            # one pair, in
 npx -y c2pa-check carry 'public/**/*.{webp,avif}' --from-dir src/  # pairs by file name
 c2pa-check carry --from clip.mov --to clip.mp4 --force            # non-picture media
 c2pa-check keygen --out-dir .c2pa                                  # cert.pem + key.pem for CI
+c2pa-check carry --from hero.png --to hero.webp --json            # machine-readable result
 ```
 
 | Signer (first that is set) | Signed as | Verifies as |
 |---|---|---|
 | `C2PA_SIGN_CERT` + `C2PA_SIGN_KEY` (PEM, a path, or `*_FILE`) | your certificate | `valid_trusted` if your CA is on the C2PA trust list |
-| `C2PA_DESIGN_API_KEY` (or `C2PA_API_KEY`) | "<your verified domain> via c2pa.design" | `valid_untrusted` |
+| `C2PA_API_KEY` (deprecated fallback `C2PA_DESIGN_API_KEY`) | "<your verified domain> via c2pa.design" | `valid_untrusted` |
 | nothing | a local key in `~/.config/c2pa-check/identity` | `valid_untrusted` |
 
-Pictures are compared first (PDQ distance ≤ 31); a different picture or an original without a
-credential is refused with exit `1`. With an API key, c2pa.design checks the carry again and
+Pictures are compared first by perceptual hash; a different picture or an original without a
+credential is refused with exit `5`. With an API key, c2pa.design checks the carry again and
 signs only an honest one; if hosted signing is unavailable, `carry` signs locally and warns.
 Never `COPY` or `ARG` a key into a Docker image: use `RUN --mount=type=secret`.
+
+`carry --json` prints one object (an array for several files):
+
+```json
+{"status": "refused", "rule": "different_picture", "message": "the two files are not the same picture",
+ "source": "hero.png", "derived": "hero.webp"}
+```
+
+`status` is `carried | composed | skipped | refused | error | unpaired | ambiguous`; `output`
+is the file written; `credential_status` is how the written file verifies. `rule` is set on a
+refusal: `different_picture`, `source_unsigned`, `low_quality`, `not_comparable`, or the rule
+c2pa.design returned with `carry_rejected` (`source_invalid`, `ingredient_mismatch`,
+`action_not_allowed`, `generator_changed`, `certificate_mismatch`, …). Refusals exit `5`.
+
+### Composites and generated assets
+
+An atlas, sprite sheet or collage is a new work, not a conversion. `--compose` signs the
+rendered file with every source attached as a `componentOf` ingredient (each keeps its own
+manifest) and a `c2pa.created` action (digital source type `composite`), plus `c2pa.placed`
+per source:
+
+```bash
+c2pa-check carry --compose a.png b.png c.png --to atlas.webp
+c2pa-check carry --compose base.png logo.png --to banner.webp --edited   # base.png is parentOf
+```
+
+`--edited` records `c2pa.opened` on the first source (as `parentOf`), `c2pa.edited`, and
+`c2pa.placed` for the rest. Composites are signed with `C2PA_SIGN_CERT` / `C2PA_SIGN_KEY` or
+the local key; hosted signing does not accept composites yet, so with only an API key the
+composite is signed locally and `carry` warns.
 
 ## For AI agents
 
@@ -77,7 +154,8 @@ The agent skill lives in [c2pa-design/skills](https://github.com/c2pa-design/ski
 npx skills add c2pa-design/skills
 ```
 
-MCP only: `claude mcp add c2pa-check -- npx -y c2pa-check mcp`.
+MCP only: `claude mcp add c2pa-check -- npx -y c2pa-check mcp`. `initialize` echoes the client's
+`protocolVersion` when supported (`2026-07-28`, `2025-11-25`, `2025-06-18`, `2025-03-26`), else `2026-07-28`.
 
 ## How trust works
 

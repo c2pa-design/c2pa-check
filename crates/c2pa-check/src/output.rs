@@ -8,9 +8,8 @@ pub fn render(
     format: Format,
     results: &[(String, Option<Report>)],
     color: bool,
+    mut out: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let mut out = std::io::stdout().lock();
-
     match format {
         Format::Text => {
             for (target, report) in results {

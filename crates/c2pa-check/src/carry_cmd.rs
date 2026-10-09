@@ -15,11 +15,15 @@ use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
 
-pub const EXIT_REFUSED: u8 = 1;
+use crate::env;
+
+pub const EXIT_REFUSED: u8 = 5;
+pub const EXIT_UNPAIRED: u8 = 1;
 pub const EXIT_ERROR: u8 = 2;
-const DEFAULT_API: &str = "https://api.c2pa.design/v1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WORKERS: usize = 8;
+const MAX_COMPOSE_SOURCES: usize = 256;
+const MAX_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
 const FALLBACK_CODES: [&str; 7] = [
     "usage_limit_exceeded",
     "rate_limited",
@@ -31,7 +35,7 @@ const FALLBACK_CODES: [&str; 7] = [
 ];
 const LOCAL_NAME: &str = "c2pa-check local identity";
 const BOUNDARY_BYTES: usize = 12;
-const SIGNER_HINT: &str = "set C2PA_DESIGN_API_KEY to sign as your organization, or C2PA_SIGN_CERT and C2PA_SIGN_KEY to sign with your own certificate";
+const SIGNER_HINT: &str = "set C2PA_API_KEY to sign as your organization, or C2PA_SIGN_CERT and C2PA_SIGN_KEY to sign with your own certificate";
 
 #[derive(Args)]
 pub struct CarryArgs {
@@ -65,6 +69,20 @@ pub struct CarryArgs {
         help = "carry media that cannot be compared as pictures (video, audio)"
     )]
     force: bool,
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        num_args = 1..,
+        conflicts_with_all = ["from", "from_dir"],
+        help = "sign --to as a new work made from these files (each attached as a componentOf ingredient)"
+    )]
+    compose: Vec<PathBuf>,
+    #[arg(
+        long,
+        requires = "compose",
+        help = "with --compose: record c2pa.edited instead of c2pa.created"
+    )]
+    edited: bool,
     #[arg(long, help = "print one JSON document")]
     json: bool,
     #[arg(
@@ -93,28 +111,30 @@ enum Mode {
 
 #[derive(Debug, Default, Serialize)]
 struct Item {
-    derived: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sources: Vec<String>,
+    #[serde(rename = "output", skip_serializing_if = "Option::is_none")]
     out: Option<String>,
-    outcome: &'static str,
+    derived: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     signer_mode: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<CredentialStatus>,
+    credential_status: Option<CredentialStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     distance: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     actions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     carry_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rule: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
 }
@@ -134,7 +154,7 @@ pub fn run(args: CarryArgs, verifier: &Verifier) -> anyhow::Result<u8> {
     let context = Run {
         verifier,
         mode,
-        tsa: env_value("C2PA_TSA_URL"),
+        tsa: env::value("C2PA_TSA_URL"),
         force: args.force,
         local: Mutex::new(None),
         chain: Mutex::new(None),
@@ -142,6 +162,13 @@ pub fn run(args: CarryArgs, verifier: &Verifier) -> anyhow::Result<u8> {
     };
 
     let items = match (&args.from, &args.to, &args.from_dir) {
+        (None, Some(to), None) if !args.compose.is_empty() => {
+            let out = args.out.clone().unwrap_or_else(|| to.clone());
+            vec![compose_one(&context, &args.compose, to, &out, args.edited)]
+        }
+        (None, None, None) if !args.compose.is_empty() => {
+            anyhow::bail!("--compose needs --to OUTPUT, the rendered composite to sign")
+        }
         (Some(from), Some(to), None) => {
             let out = args.out.clone().unwrap_or_else(|| to.clone());
             vec![carry_one(&context, from, to, &out)]
@@ -163,18 +190,18 @@ pub fn run(args: CarryArgs, verifier: &Verifier) -> anyhow::Result<u8> {
 }
 
 fn exit_code(items: &[Item], strict: bool) -> u8 {
-    if items.iter().any(|i| i.outcome == "error") {
+    if items.iter().any(|i| i.status == "error") {
         return EXIT_ERROR;
     }
-    if items.iter().any(|i| i.outcome == "refused") {
+    if items.iter().any(|i| i.status == "refused") {
         return EXIT_REFUSED;
     }
     if strict
         && items
             .iter()
-            .any(|i| matches!(i.outcome, "unpaired" | "ambiguous"))
+            .any(|i| matches!(i.status, "unpaired" | "ambiguous"))
     {
-        return EXIT_REFUSED;
+        return EXIT_UNPAIRED;
     }
     0
 }
@@ -196,16 +223,25 @@ fn report(items: &[Item], json: bool) -> anyhow::Result<()> {
         for warning in &item.warnings {
             eprintln!("warning: {}: {warning}", item.derived);
         }
-        match item.outcome {
+        match item.status {
             "carried" => println!(
                 "carried  {} <- {}  ({}, signer {}{})",
                 item.out.as_deref().unwrap_or(&item.derived),
                 item.source.as_deref().unwrap_or_default(),
-                item.status.map_or("unverified", CredentialStatus::as_str),
+                item.credential_status
+                    .map_or("unverified", CredentialStatus::as_str),
                 item.signer.as_deref().unwrap_or("unknown"),
                 item.distance
                     .map(|d| format!(", distance {d}"))
                     .unwrap_or_default(),
+            ),
+            "composed" => println!(
+                "composed {} <- {}  ({}, signer {})",
+                item.out.as_deref().unwrap_or(&item.derived),
+                item.sources.join(", "),
+                item.credential_status
+                    .map_or("unverified", CredentialStatus::as_str),
+                item.signer.as_deref().unwrap_or("unknown"),
             ),
             "skipped" => println!(
                 "skipped  {} (already carries {})",
@@ -251,10 +287,10 @@ fn batch(context: &Run<'_>, dir: &Path, patterns: &[String]) -> anyhow::Result<V
                 };
                 let item = match pairing {
                     Ok(source) => carry_one(context, source, derived, derived),
-                    Err(outcome) => Item {
+                    Err(status) => Item {
                         derived: derived.display().to_string(),
-                        outcome,
-                        message: Some(if *outcome == "unpaired" {
+                        status,
+                        message: Some(if *status == "unpaired" {
                             "no original with the same file name in --from-dir".into()
                         } else {
                             "more than one original with the same file name in --from-dir".into()
@@ -331,19 +367,162 @@ fn carry_one(context: &Run<'_>, source_path: &Path, derived_path: &Path, out_pat
         warnings: context.warnings.clone(),
         ..Item::default()
     };
-    match carry_inner(context, source_path, derived_path, out_path, &mut item) {
+    let result = carry_inner(context, source_path, derived_path, out_path, &mut item);
+    settle(item, result)
+}
+
+fn compose_one(
+    context: &Run<'_>,
+    sources: &[PathBuf],
+    output_path: &Path,
+    out_path: &Path,
+    edited: bool,
+) -> Item {
+    let mut item = Item {
+        derived: output_path.display().to_string(),
+        sources: sources.iter().map(|p| p.display().to_string()).collect(),
+        warnings: context.warnings.clone(),
+        ..Item::default()
+    };
+    let result = compose_inner(context, sources, output_path, out_path, edited, &mut item);
+    settle(item, result)
+}
+
+fn settle(mut item: Item, result: Result<(), Failure>) -> Item {
+    match result {
         Ok(()) => {}
         Err(Failure::Refused(rule, message)) => {
-            item.outcome = "refused";
+            item.status = "refused";
             item.rule = rule;
             item.message = Some(message);
         }
         Err(Failure::Error(err)) => {
-            item.outcome = "error";
+            item.status = "error";
             item.message = Some(format!("{err:#}"));
         }
     }
     item
+}
+
+pub fn read_media(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_MEDIA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() as u64 > MAX_MEDIA_BYTES {
+        anyhow::bail!(
+            "{} exceeds the {MAX_MEDIA_BYTES} byte limit",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+fn file_title(path: &Path) -> Option<String> {
+    path.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
+fn compose_inner(
+    context: &Run<'_>,
+    sources: &[PathBuf],
+    output_path: &Path,
+    out_path: &Path,
+    edited: bool,
+    item: &mut Item,
+) -> Result<(), Failure> {
+    if sources.len() > MAX_COMPOSE_SOURCES {
+        return Err(Failure::Error(anyhow!(
+            "--compose takes at most {MAX_COMPOSE_SOURCES} sources, got {}",
+            sources.len()
+        )));
+    }
+    let read = sources
+        .iter()
+        .map(|path| {
+            Ok((
+                read_media(path)?,
+                mime_from_extension(&path.to_string_lossy()),
+                file_title(path).unwrap_or_else(|| "component".into()),
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let output = read_media(output_path)?;
+    let output_mime = mime_from_extension(&output_path.to_string_lossy());
+    let components: Vec<carry::Component<'_>> = read
+        .iter()
+        .map(|(bytes, mime, title)| carry::Component { bytes, mime, title })
+        .collect();
+
+    if let Mode::Hosted { .. } = context.mode {
+        item.warnings.push(format!(
+            "hosted signing does not accept composites yet; signed with a local key. {SIGNER_HINT}"
+        ));
+    }
+    let (signer, mode) = local_signer(context, item)?;
+    let title = file_title(output_path);
+    let outcome = carry::compose(
+        &components,
+        &output,
+        output_mime,
+        edited,
+        title.as_deref(),
+        signer.as_ref(),
+    )?;
+    let unsigned = components.len() - outcome.components_with_credentials;
+    if unsigned > 0 {
+        item.warnings.push(format!(
+            "{unsigned} of {} sources carry no Content Credential; they are recorded as plain ingredients",
+            components.len()
+        ));
+    }
+
+    verify_and_write(context, &outcome.bytes, output_mime, out_path, item)?;
+    item.status = "composed";
+    item.signer_mode = Some(mode);
+    item.actions = outcome.actions;
+    Ok(())
+}
+
+fn verify_and_write(
+    context: &Run<'_>,
+    bytes: &[u8],
+    mime: &str,
+    out_path: &Path,
+    item: &mut Item,
+) -> Result<(), Failure> {
+    let verified = context
+        .verifier
+        .verify(bytes, mime, &Options::default())
+        .map_err(|e| Failure::Error(anyhow!("the signed file does not verify: {e}")))?;
+    let status = verified.credential.status;
+    if !matches!(
+        status,
+        CredentialStatus::ValidTrusted | CredentialStatus::ValidUntrusted
+    ) {
+        let codes: Vec<&str> = verified
+            .validation
+            .errors
+            .iter()
+            .map(|e| e.code.as_str())
+            .collect();
+        return Err(Failure::Error(anyhow!(
+            "the signed file verifies as {} ({}); it was not written",
+            status.as_str(),
+            codes.join(", ")
+        )));
+    }
+
+    write_atomically(out_path, bytes)?;
+    item.out = Some(out_path.display().to_string());
+    item.credential_status = Some(status);
+    item.signer = verified
+        .signer
+        .and_then(|s| s.common_name.or(s.organization))
+        .or(item.signer.take());
+    Ok(())
 }
 
 enum Failure {
@@ -360,7 +539,7 @@ impl From<anyhow::Error> for Failure {
 impl From<CarryError> for Failure {
     fn from(err: CarryError) -> Self {
         if err.refused() {
-            Self::Refused(None, err.to_string())
+            Self::Refused(err.rule().map(str::to_string), err.to_string())
         } else {
             Self::Error(anyhow!(err))
         }
@@ -374,10 +553,8 @@ fn carry_inner(
     out_path: &Path,
     item: &mut Item,
 ) -> Result<(), Failure> {
-    let source =
-        std::fs::read(source_path).with_context(|| format!("reading {}", source_path.display()))?;
-    let derived = std::fs::read(derived_path)
-        .with_context(|| format!("reading {}", derived_path.display()))?;
+    let source = read_media(source_path)?;
+    let derived = read_media(derived_path)?;
     let pair = Pair {
         source: &source,
         source_mime: mime_from_extension(&source_path.to_string_lossy()),
@@ -391,15 +568,13 @@ fn carry_inner(
         pair.derived,
         pair.derived_mime,
     ) {
-        item.outcome = "skipped";
+        item.status = "skipped";
         return Ok(());
     }
 
     let options = CarryOptions {
         force: context.force,
-        title: derived_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string()),
+        title: file_title(derived_path),
         max_pixels: Options::default().max_pixels,
     };
 
@@ -424,29 +599,8 @@ fn carry_inner(
         );
     }
 
-    let verified = context
-        .verifier
-        .verify(&outcome.bytes, pair.derived_mime, &Options::default())
-        .map_err(|e| Failure::Error(anyhow!("the carried file does not verify: {e}")))?;
-    if !matches!(
-        verified.credential.status,
-        CredentialStatus::ValidTrusted | CredentialStatus::ValidUntrusted
-    ) {
-        return Err(Failure::Error(anyhow!(
-            "the carried file verifies as {}; it was not written",
-            verified.credential.status.as_str()
-        )));
-    }
-
-    write_atomically(out_path, &outcome.bytes)?;
-    item.outcome = "carried";
-    item.out = Some(out_path.display().to_string());
-    item.status = Some(verified.credential.status);
-    item.signer = verified
-        .signer
-        .as_ref()
-        .and_then(|s| s.common_name.clone().or_else(|| s.organization.clone()))
-        .or(item.signer.take());
+    verify_and_write(context, &outcome.bytes, pair.derived_mime, out_path, item)?;
+    item.status = "carried";
     item.actions = outcome.actions;
     item.distance = outcome.distance;
     Ok(())
@@ -482,19 +636,25 @@ fn local(
     options: &CarryOptions,
     item: &mut Item,
 ) -> Result<CarryOutcome, Failure> {
-    let (signer, mode) = match &context.mode {
-        Mode::Own { chain, key } => (carry::local_signer(chain, key, context.tsa.clone())?, "own"),
-        _ => (local_identity_signer(context, item)?, "local"),
-    };
+    let (signer, mode) = local_signer(context, item)?;
     let outcome = pair.carry(signer.as_ref(), options)?;
     item.signer_mode = Some(mode);
     Ok(outcome)
 }
 
-fn local_identity_signer(
+type BoxedSigner = Box<dyn c2pa_check_core::c2pa::Signer + Send + Sync>;
+
+fn local_signer(
     context: &Run<'_>,
     item: &mut Item,
-) -> Result<Box<dyn c2pa_check_core::c2pa::Signer + Send + Sync>, Failure> {
+) -> Result<(BoxedSigner, &'static str), Failure> {
+    Ok(match &context.mode {
+        Mode::Own { chain, key } => (carry::local_signer(chain, key, context.tsa.clone())?, "own"),
+        _ => (local_identity_signer(context, item)?, "local"),
+    })
+}
+
+fn local_identity_signer(context: &Run<'_>, item: &mut Item) -> Result<BoxedSigner, Failure> {
     let mut slot = context
         .local
         .lock()
@@ -827,18 +987,14 @@ fn jitter() -> Duration {
     Duration::from_millis(200 + u64::from(nanos % 500))
 }
 
-fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
-}
-
 fn pem_from_env(name: &str) -> anyhow::Result<Option<(String, Option<PathBuf>)>> {
-    if let Some(path) = env_value(&format!("{name}_FILE")) {
+    if let Some(path) = env::value(&format!("{name}_FILE")) {
         let path = PathBuf::from(path);
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("{name}_FILE {}", path.display()))?;
         return Ok(Some((text, Some(path))));
     }
-    match env_value(name) {
+    match env::value(name) {
         Some(value) if value.contains("-----BEGIN") => Ok(Some((value, None))),
         Some(path) => {
             let path = PathBuf::from(path);
@@ -876,11 +1032,14 @@ fn mode_from_env() -> (Mode, Vec<String>) {
         }
         _ => {}
     }
-    if let Some(key) = env_value("C2PA_DESIGN_API_KEY").or_else(|| env_value("C2PA_API_KEY")) {
-        let base = env_value("C2PA_DESIGN_API_URL")
-            .or_else(|| env_value("C2PA_API_BASE"))
-            .unwrap_or_else(|| DEFAULT_API.to_string());
-        return (Mode::Hosted { base, key }, warnings);
+    if let Some(key) = env::api_key() {
+        return (
+            Mode::Hosted {
+                base: env::api_base(),
+                key,
+            },
+            warnings,
+        );
     }
     (Mode::Local, warnings)
 }
@@ -944,10 +1103,11 @@ pub fn keygen(args: KeygenArgs) -> anyhow::Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_server::serve;
 
-    fn item(outcome: &'static str) -> Item {
+    fn item(status: &'static str) -> Item {
         Item {
-            outcome,
+            status,
             ..Item::default()
         }
     }
@@ -968,7 +1128,7 @@ mod tests {
     #[test]
     fn unpaired_files_fail_only_in_strict_mode() {
         assert_eq!(exit_code(&[item("carried"), item("unpaired")], false), 0);
-        assert_eq!(exit_code(&[item("ambiguous")], true), EXIT_REFUSED);
+        assert_eq!(exit_code(&[item("ambiguous")], true), EXIT_UNPAIRED);
     }
 
     #[test]
@@ -1075,7 +1235,7 @@ mod tests {
             serde_json::from_str(&json_document(&[item("carried"), item("refused")]).unwrap())
                 .unwrap();
 
-        assert_eq!(one["outcome"], "carried");
+        assert_eq!(one["status"], "carried");
         assert_eq!(two.as_array().map(Vec::len), Some(2));
     }
 
@@ -1120,80 +1280,6 @@ mod tests {
 
         assert_ne!(a, b);
         assert_eq!(a.len(), "c2pa-check-".len() + 2 * BOUNDARY_BYTES);
-    }
-
-    struct Request {
-        path: String,
-        content_type: String,
-        body: Vec<u8>,
-    }
-
-    fn read_request(stream: &mut std::net::TcpStream) -> Request {
-        use std::io::Read;
-
-        let mut raw = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let head_end = loop {
-            let n = stream.read(&mut chunk).unwrap();
-            assert!(n > 0, "the client closed before sending headers");
-            raw.extend_from_slice(&chunk[..n]);
-            if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                break at + 4;
-            }
-        };
-        let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
-        let header = |name: &str| {
-            head.lines()
-                .find_map(|line| {
-                    let (key, value) = line.split_once(':')?;
-                    key.eq_ignore_ascii_case(name)
-                        .then(|| value.trim().to_string())
-                })
-                .unwrap_or_default()
-        };
-        let length: usize = header("content-length").parse().unwrap_or(0);
-        while raw.len() < head_end + length {
-            let n = stream.read(&mut chunk).unwrap();
-            assert!(n > 0, "the client closed mid-body");
-            raw.extend_from_slice(&chunk[..n]);
-        }
-
-        Request {
-            path: head
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_default()
-                .to_string(),
-            content_type: header("content-type"),
-            body: raw[head_end..head_end + length].to_vec(),
-        }
-    }
-
-    fn serve(
-        requests: usize,
-        handler: impl Fn(&Request) -> (u16, String) + Send + 'static,
-    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        use std::io::Write;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}/v1", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            let mut paths = Vec::new();
-            for _ in 0..requests {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_request(&mut stream);
-                let (status, body) = handler(&request);
-                write!(
-                    stream,
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-                paths.push(request.path);
-            }
-            paths
-        });
-        (base, handle)
     }
 
     fn outcome_of(result: Result<Value, Hosted>) -> String {
@@ -1406,11 +1492,14 @@ mod tests {
         let carried = std::fs::read(dir.join("hero.carried.webp"));
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(item.outcome, "carried", "{:?}", item.message);
+        assert_eq!(item.status, "carried", "{:?}", item.message);
         assert_eq!(item.signer_mode, Some("hosted"));
         assert_eq!(item.carry_id.as_deref(), Some("carry_1"));
         assert_eq!(item.signer.as_deref(), Some("acme.example via c2pa.design"));
-        assert_eq!(item.status, Some(CredentialStatus::ValidUntrusted));
+        assert_eq!(
+            item.credential_status,
+            Some(CredentialStatus::ValidUntrusted)
+        );
         assert_eq!(item.actions, ["c2pa.opened", "c2pa.transcoded"]);
         assert!(item.warnings.is_empty(), "{:?}", item.warnings);
         assert_eq!(paths, ["/v1/sign/certificate", "/v1/sign"]);
@@ -1418,5 +1507,261 @@ mod tests {
             .verify(&carried.unwrap(), "image/webp", &Options::default())
             .unwrap();
         assert_eq!(report.ingredients.len(), 1);
+    }
+
+    #[test]
+    fn a_composite_is_signed_as_a_new_work_with_every_source_as_a_component() {
+        let dir = scratch("compose");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("a.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("b.png"),
+            encoded(&picture(), image::ImageFormat::Png),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("atlas.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let context = own_context(&verifier);
+        let sources = [dir.join("a.png"), dir.join("b.png")];
+
+        let created = compose_one(
+            &context,
+            &sources,
+            &dir.join("atlas.webp"),
+            &dir.join("created.webp"),
+            false,
+        );
+        let edited = compose_one(
+            &context,
+            &sources,
+            &dir.join("atlas.webp"),
+            &dir.join("edited.webp"),
+            true,
+        );
+        let created_bytes = std::fs::read(dir.join("created.webp"));
+        let edited_bytes = std::fs::read(dir.join("edited.webp"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(created.status, "composed", "{:?}", created.message);
+        assert_eq!(edited.status, "composed", "{:?}", edited.message);
+        assert_eq!(created.signer_mode, Some("own"));
+        assert_eq!(created.actions, ["c2pa.created", "c2pa.placed"]);
+        assert_eq!(
+            edited.actions,
+            ["c2pa.opened", "c2pa.edited", "c2pa.placed"]
+        );
+        assert_eq!(
+            created.credential_status,
+            Some(CredentialStatus::ValidUntrusted)
+        );
+        assert!(created
+            .warnings
+            .iter()
+            .any(|w| w.contains("1 of 2 sources")));
+        let report = verifier
+            .verify(
+                &created_bytes.unwrap(),
+                "image/webp",
+                &Options {
+                    include_raw: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(report.ingredients.len(), 2);
+        let raw = serde_json::to_string(&report.raw_manifest_store).unwrap();
+        assert_eq!(raw.matches("componentOf").count(), 2);
+        assert!(raw.contains("c2pa.created"));
+        assert!(!raw.contains("c2pa.edited"));
+
+        let edited_report = verifier
+            .verify(
+                &edited_bytes.unwrap(),
+                "image/webp",
+                &Options {
+                    include_raw: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+        let edited_raw = serde_json::to_string(&edited_report.raw_manifest_store).unwrap();
+        assert_eq!(edited_raw.matches("parentOf").count(), 1);
+        assert_eq!(edited_raw.matches("componentOf").count(), 1);
+        assert!(edited_raw.contains("c2pa.edited"));
+    }
+
+    fn own_context(verifier: &Verifier) -> Run<'_> {
+        let own = carry::generate_identity("acme.example").unwrap();
+        Run {
+            verifier,
+            mode: Mode::Own {
+                chain: own.chain_pem,
+                key: own.key_pem,
+            },
+            tsa: None,
+            force: false,
+            local: Mutex::new(None),
+            chain: Mutex::new(None),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn no_trust_verifier() -> Verifier {
+        Verifier::new(
+            &c2pa_check_core::TrustBundle::default(),
+            c2pa_check_core::report::TrustSelector::None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_different_picture_is_refused_with_a_rule_and_exit_5() {
+        let dir = scratch("refused");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        let mut other = picture();
+        other.invert();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&other.fliph(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let context = own_context(&verifier);
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        let written = dir.join("out.webp").exists();
+        std::fs::remove_dir_all(&dir).ok();
+        let items = [item];
+        let value: Value = serde_json::from_str(&json_document(&items).unwrap()).unwrap();
+
+        assert!(!written);
+        assert_eq!(value["status"], "refused");
+        assert_eq!(value["rule"], "different_picture");
+        assert!(value["message"].as_str().unwrap().contains("PDQ distance"));
+        assert!(value["source"].as_str().unwrap().ends_with("hero.png"));
+        assert!(value["derived"].as_str().unwrap().ends_with("hero.webp"));
+        assert!(value.get("output").is_none());
+        assert!(value.get("signer_mode").is_none());
+        assert!(value.get("outcome").is_none());
+        assert_eq!(exit_code(&items, false), EXIT_REFUSED);
+        assert_eq!(EXIT_REFUSED, 5);
+    }
+
+    #[test]
+    fn a_carried_file_reports_output_signer_and_credential_status_in_json() {
+        let dir = scratch("carried-json");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let context = own_context(&verifier);
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        let items = [item];
+        let value: Value = serde_json::from_str(&json_document(&items).unwrap()).unwrap();
+
+        assert_eq!(value["status"], "carried", "{value}");
+        assert!(value["output"].as_str().unwrap().ends_with("out.webp"));
+        assert_eq!(value["signer_mode"], "own");
+        assert_eq!(value["signer"], "acme.example");
+        assert_eq!(value["credential_status"], "valid_untrusted");
+        assert_eq!(value["distance"], 0);
+        assert_eq!(value["actions"][0], "c2pa.opened");
+        assert_eq!(exit_code(&items, false), 0);
+    }
+
+    #[test]
+    fn compose_rejects_too_many_sources_before_reading_any() {
+        let verifier = no_trust_verifier();
+        let context = own_context(&verifier);
+        let sources = vec![PathBuf::from("/nonexistent/a.png"); MAX_COMPOSE_SOURCES + 1];
+
+        let item = compose_one(
+            &context,
+            &sources,
+            Path::new("/nonexistent/atlas.png"),
+            Path::new("/nonexistent/out.png"),
+            false,
+        );
+
+        assert_eq!(item.status, "error");
+        assert!(item.message.unwrap().contains("at most"));
+    }
+
+    #[test]
+    fn compose_reports_a_missing_source_as_an_error() {
+        let verifier = no_trust_verifier();
+        let context = own_context(&verifier);
+
+        let item = compose_one(
+            &context,
+            &[PathBuf::from("/nonexistent/a.png")],
+            Path::new("/nonexistent/atlas.png"),
+            Path::new("/nonexistent/out.png"),
+            false,
+        );
+
+        assert_eq!(item.status, "error");
+        assert!(item.message.unwrap().contains("reading /nonexistent/a.png"));
+    }
+
+    #[test]
+    fn media_larger_than_the_cap_is_not_read() {
+        let dir = scratch("oversized");
+        let path = dir.join("big.png");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_MEDIA_BYTES + 1)
+            .unwrap();
+        let small = dir.join("small.png");
+        std::fs::write(&small, b"png").unwrap();
+
+        let big = read_media(&path);
+        let ok = read_media(&small);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(big.unwrap_err().to_string().contains("byte limit"));
+        assert_eq!(ok.unwrap(), b"png");
+    }
+
+    #[test]
+    fn the_json_report_names_status_rule_message_source_and_output() {
+        let items = vec![Item {
+            derived: "hero.webp".into(),
+            source: Some("hero.png".into()),
+            out: Some("hero.webp".into()),
+            status: "refused",
+            rule: Some("different_picture".into()),
+            message: Some("not the same picture".into()),
+            ..Item::default()
+        }];
+        let value: Value = serde_json::from_str(&json_document(&items).unwrap()).unwrap();
+
+        assert_eq!(value["status"], "refused");
+        assert_eq!(value["rule"], "different_picture");
+        assert_eq!(value["message"], "not the same picture");
+        assert_eq!(value["source"], "hero.png");
+        assert_eq!(value["output"], "hero.webp");
+        assert_eq!(exit_code(&items, false), 5);
     }
 }

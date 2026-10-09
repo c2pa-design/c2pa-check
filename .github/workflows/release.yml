@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y musl-tools
           echo "CC_$(echo '${{ matrix.target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
       - run: cargo build --release --target ${{ matrix.target }} -p c2pa-check
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: c2pa-check-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/c2pa-check*
@@ -39,13 +39,58 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
       - run: node npm/publish.mjs dist "${GITHUB_REF_NAME#v}" --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Verify npm provenance and integrity
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir verify && cd verify && npm init -y >/dev/null
+          npm install --no-save "c2pa-check@$version"
+          npm audit signatures
+          npm view "c2pa-check@$version" dist.integrity
+
+  github:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir out
+          for dir in dist/c2pa-check-*; do
+            name=$(basename "$dir")
+            if [ -f "$dir/c2pa-check.exe" ]; then
+              (cd "$dir" && zip -q "../../out/$name.zip" c2pa-check.exe)
+            else
+              chmod +x "$dir/c2pa-check"
+              tar czf "out/$name.tar.gz" -C "$dir" c2pa-check
+            fi
+          done
+          (cd out && sha256sum * > SHA256SUMS)
+          cat out/SHA256SUMS
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: out/c2pa-check-*
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" out/* --clobber

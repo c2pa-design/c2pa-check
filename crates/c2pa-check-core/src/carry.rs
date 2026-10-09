@@ -10,6 +10,8 @@ use crate::{media, Options, Verifier, ENGINE_VERSION};
 
 pub const PLACEHOLDER_LEN: usize = 64;
 const GENERATOR: &str = "c2pa-check carry";
+const GENERATOR_COMPOSE: &str = "c2pa-check compose";
+const COMPOSITE_SOURCE_TYPE: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/composite";
 const SIGNATURE_PREFIX: [u8; 2] = [0x58, 0x40];
 const PARENT_LABEL: &str = "parent";
 const RESERVE_MARGIN: usize = 16 * 1024;
@@ -53,6 +55,16 @@ pub enum CarryError {
 }
 
 impl CarryError {
+    pub fn rule(&self) -> Option<&'static str> {
+        match self {
+            Self::NoSourceCredential => Some("source_unsigned"),
+            Self::DifferentPicture(_) => Some("different_picture"),
+            Self::LowQuality => Some("low_quality"),
+            Self::NotComparable => Some("not_comparable"),
+            _ => None,
+        }
+    }
+
     pub fn refused(&self) -> bool {
         matches!(
             self,
@@ -117,7 +129,16 @@ pub fn carry(
         actions.push("c2pa.resized".to_string());
     }
 
-    let mut builder = builder(derived_mime, options.title.as_deref(), &actions)?;
+    let parent_actions = actions
+        .iter()
+        .map(|action| json!({"action": action, "parameters": {"ingredientIds": [PARENT_LABEL]}}))
+        .collect();
+    let mut builder = builder(
+        GENERATOR,
+        derived_mime,
+        options.title.as_deref().unwrap_or("carried"),
+        parent_actions,
+    )?;
     let parent = json!({
         "title": "source",
         "relationship": "parentOf",
@@ -145,10 +166,113 @@ pub fn carry(
     })
 }
 
-fn builder(
-    derived_mime: &str,
+pub struct Component<'a> {
+    pub bytes: &'a [u8],
+    pub mime: &'a str,
+    pub title: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComposeOutcome {
+    pub bytes: Vec<u8>,
+    pub actions: Vec<String>,
+    pub components_with_credentials: usize,
+}
+
+pub fn compose(
+    components: &[Component<'_>],
+    output: &[u8],
+    output_mime: &str,
+    edited: bool,
     title: Option<&str>,
-    actions: &[String],
+    signer: &dyn c2pa::Signer,
+) -> Result<ComposeOutcome, CarryError> {
+    let output_format = media::format_for(output_mime)
+        .ok_or_else(|| CarryError::UnsupportedMediaType(output_mime.to_string()))?;
+    if components.is_empty() {
+        return Err(CarryError::Source("no component files".into()));
+    }
+
+    let labels: Vec<String> = (0..components.len())
+        .map(|i| format!("component{i}"))
+        .collect();
+    let placed_from = usize::from(edited);
+    let (mut actions, mut names) = if edited {
+        (
+            vec![
+                json!({"action": "c2pa.opened", "parameters": {"ingredientIds": [labels[0]]}}),
+                json!({"action": "c2pa.edited"}),
+            ],
+            vec!["c2pa.opened", "c2pa.edited"],
+        )
+    } else {
+        (
+            vec![json!({"action": "c2pa.created", "digitalSourceType": COMPOSITE_SOURCE_TYPE})],
+            vec!["c2pa.created"],
+        )
+    };
+    actions.extend(
+        labels[placed_from..].iter().map(
+            |label| json!({"action": "c2pa.placed", "parameters": {"ingredientIds": [label]}}),
+        ),
+    );
+    if labels.len() > placed_from {
+        names.push("c2pa.placed");
+    }
+
+    let mut builder = builder(
+        GENERATOR_COMPOSE,
+        output_mime,
+        title.unwrap_or("composite"),
+        actions,
+    )?;
+    let mut with_credentials = 0;
+    for (index, (component, label)) in components.iter().zip(&labels).enumerate() {
+        let format = media::format_for(component.mime)
+            .ok_or_else(|| CarryError::UnsupportedMediaType(component.mime.to_string()))?;
+        if store(component.bytes, component.mime)
+            .as_ref()
+            .and_then(active_label)
+            .is_some()
+        {
+            with_credentials += 1;
+        }
+        let relationship = if index < placed_from {
+            "parentOf"
+        } else {
+            "componentOf"
+        };
+        let ingredient = json!({
+            "title": component.title,
+            "relationship": relationship,
+            "label": label,
+        });
+        builder
+            .add_ingredient_from_stream(
+                ingredient.to_string(),
+                format,
+                &mut Cursor::new(component.bytes),
+            )
+            .map_err(|e| CarryError::Source(e.to_string()))?;
+    }
+
+    let mut signed = Cursor::new(Vec::new());
+    builder
+        .sign(signer, output_format, &mut Cursor::new(output), &mut signed)
+        .map_err(|e| CarryError::Sign(e.to_string()))?;
+
+    Ok(ComposeOutcome {
+        bytes: signed.into_inner(),
+        actions: names.into_iter().map(str::to_string).collect(),
+        components_with_credentials: with_credentials,
+    })
+}
+
+fn builder(
+    generator: &str,
+    mime: &str,
+    title: &str,
+    actions: Vec<Value>,
 ) -> Result<c2pa::Builder, CarryError> {
     let context = c2pa::Context::new()
         .with_settings(json!({
@@ -157,21 +281,11 @@ fn builder(
         }))
         .map_err(|e| CarryError::Sign(e.to_string()))?;
 
-    let actions: Vec<Value> = actions
-        .iter()
-        .map(|action| {
-            json!({
-                "action": action,
-                "parameters": {"ingredientIds": [PARENT_LABEL]}
-            })
-        })
-        .collect();
-
     c2pa::Builder::from_context(context)
         .with_definition(json!({
-            "claim_generator_info": [{"name": GENERATOR, "version": ENGINE_VERSION}],
-            "title": title.unwrap_or("carried"),
-            "format": base_mime(derived_mime),
+            "claim_generator_info": [{"name": generator, "version": ENGINE_VERSION}],
+            "title": title,
+            "format": base_mime(mime),
             "assertions": [{"label": "c2pa.actions", "data": {"actions": actions}}]
         }))
         .map_err(|e| CarryError::Sign(e.to_string()))
