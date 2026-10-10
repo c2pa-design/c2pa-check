@@ -7,7 +7,7 @@ branding:
 
 inputs:
   paths:
-    description: Glob of files to verify, e.g. "public/**/*.{jpg,png,webp}".
+    description: Glob of files to verify, e.g. "public/**/*.{jpg,png,webp}". Empty with empty urls runs the checks in c2pa.json.
     required: false
     default: ""
   urls:
@@ -15,9 +15,17 @@ inputs:
     required: false
     default: ""
   coverage:
-    description: Fail when fewer than this percentage of targets are trusted.
+    description: Fail when fewer than this percentage of targets are trusted (with paths or urls; c2pa.json sets its own).
     required: false
     default: "100"
+  baseline:
+    description: Baseline file; fail when a file that had a valid credential in it has lost it (with paths).
+    required: false
+    default: ""
+  register:
+    description: "true to register the checked files with c2pa.design after the check (needs C2PA_API_KEY in env)."
+    required: false
+    default: "false"
   expect:
     description: present | trusted | absent
     required: false
@@ -43,9 +51,9 @@ inputs:
     required: false
     default: ""
   version:
-    description: Release tag of c2pa-check to run (e.g. v0.2.0), or latest.
+    description: Release tag of c2pa-check to run (e.g. v0.3.0), or latest.
     required: false
-    default: v0.2.0
+    default: v0.3.0
 
 outputs:
   coverage:
@@ -118,22 +126,28 @@ runs:
         INPUT_PATHS: ${{ inputs.paths }}
         INPUT_URLS: ${{ inputs.urls }}
         INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_REGISTER: ${{ inputs.register }}
       run: |
         set -uo pipefail
-        args=(--trust "$INPUT_TRUST" --format "$INPUT_FORMAT")
-        if [ -n "$INPUT_COVERAGE" ]; then args+=(--coverage "$INPUT_COVERAGE"); fi
-        if [ -n "$INPUT_EXPECT" ]; then args+=(--expect "$INPUT_EXPECT"); fi
-        if [ -n "$INPUT_OUTPUT" ]; then args+=(--output "$INPUT_OUTPUT"); fi
-
         targets=()
         if [ -n "$INPUT_PATHS" ]; then targets+=("$INPUT_PATHS"); fi
         while IFS= read -r url; do
           [ -n "$url" ] && targets+=("$url")
         done <<< "$INPUT_URLS"
 
+        args=(--trust "$INPUT_TRUST" --format "$INPUT_FORMAT")
+        if [ -n "$INPUT_OUTPUT" ]; then args+=(--output "$INPUT_OUTPUT"); fi
+        if [ "$INPUT_REGISTER" = "true" ]; then args+=(--register); fi
         if [ ${#targets[@]} -eq 0 ]; then
-          echo "::error::give the action paths or urls"
-          exit 2
+          if [ ! -f c2pa.json ]; then
+            echo "::error::give the action paths or urls, or commit a c2pa.json with checks"
+            exit 2
+          fi
+        else
+          if [ -n "$INPUT_COVERAGE" ]; then args+=(--coverage "$INPUT_COVERAGE"); fi
+          if [ -n "$INPUT_EXPECT" ]; then args+=(--expect "$INPUT_EXPECT"); fi
+          if [ -n "$INPUT_BASELINE" ]; then args+=(--baseline "$INPUT_BASELINE"); fi
         fi
 
         c2pa-check "${args[@]}" "${targets[@]}" | tee result.txt

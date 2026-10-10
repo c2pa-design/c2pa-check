@@ -23,6 +23,7 @@ const ALLOWED_ACTIONS: [&str; 5] = [
     "c2pa.converted",
     "c2pa.compressed",
 ];
+const COMPOSE_ACTIONS: [&str; 4] = ["c2pa.created", "c2pa.placed", "c2pa.opened", "c2pa.edited"];
 const ALLOWED_ASSERTIONS: [&str; 4] = [
     "c2pa.actions",
     "c2pa.ingredient",
@@ -665,15 +666,9 @@ impl Verifier {
             );
         };
 
-        let patched = match patch_placeholder(input.derived, input.placeholder, input.signature) {
+        let patched = match patch_for_check(input.derived, input.placeholder, input.signature) {
             Ok(bytes) => bytes,
-            Err(CarryError::PlaceholderAmbiguous) => {
-                return check.reject(
-                    "placeholder_ambiguous",
-                    "the placeholder appears more than once",
-                )
-            }
-            Err(err) => return check.reject("placeholder_missing", err.to_string()),
+            Err((rule, detail)) => return check.reject(rule, detail),
         };
         check.derived.sha256 = crate::digest::hex_sha256(&patched);
 
@@ -726,8 +721,9 @@ impl Verifier {
             _ => return check.reject("signature_invalid", derived_codes),
         }
 
-        if let Err((rule, detail)) = policy(derived_store.as_ref(), source_label, ingredient_valid)
-        {
+        let outcome = manifest_of(derived_store.as_ref())
+            .and_then(|(label, manifest)| policy(label, manifest, source_label, ingredient_valid));
+        if let Err((rule, detail)) = outcome {
             return check.reject(rule, detail);
         }
 
@@ -748,6 +744,169 @@ impl Verifier {
 
         check
     }
+}
+
+pub struct ComposeInput<'a> {
+    pub composite: &'a [u8],
+    pub mime: &'a str,
+    pub placeholder: &'a [u8],
+    pub signature: &'a [u8],
+}
+
+impl Verifier {
+    pub fn compose_check(&self, input: &ComposeInput<'_>, options: &Options) -> CarryCheck {
+        let options = Options {
+            include_raw: true,
+            ..options.clone()
+        };
+        let mut check = CarryCheck {
+            accepted: true,
+            rule: String::new(),
+            detail: String::new(),
+            source: CarrySide::default(),
+            derived: CarrySide::new(input.composite, input.mime),
+            distance: None,
+        };
+
+        if media::format_for(input.mime).is_none() {
+            return check.reject(
+                "derived_unreadable",
+                format!("unsupported media type {:?}", input.mime),
+            );
+        }
+        let patched = match patch_for_check(input.composite, input.placeholder, input.signature) {
+            Ok(bytes) => bytes,
+            Err((rule, detail)) => return check.reject(rule, detail),
+        };
+        check.derived.sha256 = crate::digest::hex_sha256(&patched);
+
+        let mut composite = match self.verify(&patched, input.mime, &options) {
+            Ok(report) => report,
+            Err(err) => return check.reject("derived_unreadable", err.to_string()),
+        };
+        drop(patched);
+        let store = composite.raw_manifest_store.take();
+        check.derived.certificate_serial = composite
+            .signer
+            .as_ref()
+            .and_then(|s| s.cert_serial.clone());
+        let status = composite.credential.status;
+        let failures = codes(&composite);
+        let components: Vec<Option<CredentialStatus>> = composite
+            .ingredients
+            .iter()
+            .map(|i| i.credential_status)
+            .collect();
+        check.derived.record(composite);
+        match status {
+            CredentialStatus::ValidTrusted | CredentialStatus::ValidUntrusted => {}
+            CredentialStatus::Absent => {
+                return check.reject("derived_unreadable", "the composite has no manifest")
+            }
+            _ => return check.reject("signature_invalid", failures),
+        }
+
+        let outcome = manifest_of(store.as_ref())
+            .and_then(|(_, manifest)| compose_policy(manifest, &components));
+        if let Err((rule, detail)) = outcome {
+            return check.reject(rule, detail);
+        }
+
+        check
+    }
+}
+
+fn compose_policy(
+    manifest: &Value,
+    components: &[Option<CredentialStatus>],
+) -> Result<(), Refusal> {
+    assertions_allowed(manifest, &COMPOSE_ACTIONS, Some(COMPOSITE_SOURCE_TYPE))?;
+    if !declares_new_work(manifest) {
+        return Err((
+            "action_not_allowed",
+            "a composite must declare c2pa.created or c2pa.edited".into(),
+        ));
+    }
+
+    let ingredients = manifest
+        .get("ingredients")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if ingredients.is_empty() || ingredients.len() != components.len() {
+        return Err((
+            "ingredient_mismatch",
+            format!(
+                "{} components, {} could be checked",
+                ingredients.len(),
+                components.len()
+            ),
+        ));
+    }
+
+    let relationship = |item: &Value| {
+        item.get("relationship")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    if let Some(other) = ingredients
+        .iter()
+        .map(relationship)
+        .find(|r| r != "componentOf" && r != "parentOf")
+    {
+        return Err((
+            "ingredient_mismatch",
+            format!("a component is {other:?}, not componentOf or parentOf"),
+        ));
+    }
+    if ingredients
+        .iter()
+        .filter(|item| relationship(item) == "parentOf")
+        .count()
+        > 1
+    {
+        return Err(("ingredient_mismatch", "more than one parentOf".into()));
+    }
+
+    if components.iter().any(|status| {
+        !matches!(status, Some(CredentialStatus::Absent)) && !status.is_some_and(is_valid)
+    }) {
+        return Err((
+            "component_invalid",
+            "a component's Content Credential does not validate".into(),
+        ));
+    }
+    if !components.iter().any(|status| status.is_some_and(is_valid)) {
+        return Err((
+            "component_unsigned",
+            "no component carries a valid Content Credential".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn patch_for_check(bytes: &[u8], placeholder: &[u8], signature: &[u8]) -> Result<Vec<u8>, Refusal> {
+    patch_placeholder(bytes, placeholder, signature).map_err(|err| match err {
+        CarryError::PlaceholderAmbiguous => (
+            "placeholder_ambiguous",
+            "the placeholder appears more than once".to_string(),
+        ),
+        other => ("placeholder_missing", other.to_string()),
+    })
+}
+
+fn declares_new_work(manifest: &Value) -> bool {
+    manifest
+        .get("assertions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|assertion| assertion.pointer("/data/actions")?.as_array())
+        .flatten()
+        .filter_map(|action| action.get("action")?.as_str())
+        .any(|name| name == "c2pa.created" || name == "c2pa.edited")
 }
 
 fn is_valid(status: CredentialStatus) -> bool {
@@ -781,25 +940,23 @@ fn codes(report: &Report) -> String {
 
 type Refusal = (&'static str, String);
 
-fn policy(
-    store: Option<&Value>,
-    source_label: &str,
-    ingredient_valid: bool,
-) -> Result<(), Refusal> {
+fn manifest_of(store: Option<&Value>) -> Result<(&str, &Value), Refusal> {
     let store = store.ok_or(("derived_unreadable", "no manifest store".to_string()))?;
     let label =
         active_label(store).ok_or(("derived_unreadable", "no active manifest".to_string()))?;
-    if label == source_label {
-        return Err((
-            "ingredient_mismatch",
-            "the derived file carries the source manifest unchanged".into(),
-        ));
-    }
     let manifest = store.get("manifests").and_then(|m| m.get(label)).ok_or((
         "derived_unreadable",
         "the active manifest is missing".to_string(),
     ))?;
 
+    Ok((label, manifest))
+}
+
+fn assertions_allowed(
+    manifest: &Value,
+    actions: &[&str],
+    created_as: Option<&str>,
+) -> Result<(), Refusal> {
     for assertion in manifest
         .get("assertions")
         .and_then(Value::as_array)
@@ -817,9 +974,26 @@ fn policy(
             return Err(("assertion_not_allowed", name.to_string()));
         }
         if name.starts_with("c2pa.actions") {
-            actions_allowed(assertion.get("data"))?;
+            actions_allowed(assertion.get("data"), actions, created_as)?;
         }
     }
+
+    Ok(())
+}
+
+fn policy(
+    label: &str,
+    manifest: &Value,
+    source_label: &str,
+    ingredient_valid: bool,
+) -> Result<(), Refusal> {
+    if label == source_label {
+        return Err((
+            "ingredient_mismatch",
+            "the derived file carries the source manifest unchanged".into(),
+        ));
+    }
+    assertions_allowed(manifest, &ALLOWED_ACTIONS, None)?;
 
     let ingredients = manifest
         .get("ingredients")
@@ -854,24 +1028,30 @@ fn policy(
     Ok(())
 }
 
-fn actions_allowed(data: Option<&Value>) -> Result<(), Refusal> {
-    for action in data
-        .and_then(|d| d.get("actions"))
-        .and_then(Value::as_array)
+fn actions_allowed(
+    data: Option<&Value>,
+    allowed: &[&str],
+    created_as: Option<&str>,
+) -> Result<(), Refusal> {
+    for action in ["actions", "templates"]
         .into_iter()
+        .filter_map(|field| data.and_then(|d| d.get(field)).and_then(Value::as_array))
         .flatten()
     {
         let name = action
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if !ALLOWED_ACTIONS.contains(&name) {
+        if !allowed.contains(&name) {
             return Err(("action_not_allowed", name.to_string()));
         }
-        if action.get("digitalSourceType").is_some() {
+        let declared = action.get("digitalSourceType").and_then(Value::as_str);
+        let expected = created_as.filter(|_| name == "c2pa.created");
+        if declared != expected || (declared.is_none() && action.get("digitalSourceType").is_some())
+        {
             return Err((
                 "generator_changed",
-                format!("{name} declares a digital source type"),
+                format!("{name} declares digital source type {declared:?}"),
             ));
         }
         let agent = match action.get("softwareAgent") {
@@ -895,6 +1075,173 @@ fn actions_allowed(data: Option<&Value>) -> Result<(), Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn carry_actions(data: Option<&Value>) -> Result<(), Refusal> {
+        actions_allowed(data, &ALLOWED_ACTIONS, None)
+    }
+
+    fn carry_policy(store: Option<&Value>, source_label: &str, valid: bool) -> Result<(), Refusal> {
+        manifest_of(store)
+            .and_then(|(label, manifest)| policy(label, manifest, source_label, valid))
+    }
+
+    fn composite(actions: Value, relationships: &[&str]) -> Value {
+        json!({
+            "assertions": [{"label": "c2pa.actions.v2", "data": {"actions": actions}}],
+            "ingredients": relationships.iter().map(|r| json!({"relationship": r})).collect::<Vec<_>>(),
+        })
+    }
+
+    fn honest_actions() -> Value {
+        json!([
+            {"action": "c2pa.created", "digitalSourceType": COMPOSITE_SOURCE_TYPE},
+            {"action": "c2pa.placed"}
+        ])
+    }
+
+    #[test]
+    fn an_action_template_cannot_carry_what_an_action_may_not() {
+        let template = |entry: Value| json!({"actions": [], "templates": [entry]});
+
+        assert!(carry_actions(Some(&template(json!({"action": "c2pa.opened"})))).is_ok());
+        for entry in [
+            json!({"action": "c2pa.opened", "digitalSourceType": "x"}),
+            json!({"action": "c2pa.opened", "softwareAgent": "other"}),
+            json!({"action": "c2pa.filtered"}),
+        ] {
+            assert!(carry_actions(Some(&template(entry))).is_err());
+        }
+    }
+
+    #[test]
+    fn a_composite_of_valid_and_unsigned_components_passes() {
+        let manifest = composite(honest_actions(), &["componentOf", "componentOf"]);
+        let components = [
+            Some(CredentialStatus::ValidTrusted),
+            Some(CredentialStatus::Absent),
+        ];
+        let edited = composite(
+            json!([{"action": "c2pa.opened"}, {"action": "c2pa.edited"}]),
+            &["parentOf"],
+        );
+
+        assert!(compose_policy(&manifest, &components).is_ok());
+        assert!(compose_policy(&edited, &[Some(CredentialStatus::ValidUntrusted)]).is_ok());
+    }
+
+    #[test]
+    fn a_composite_is_refused_for_each_broken_rule() {
+        let valid = Some(CredentialStatus::ValidTrusted);
+        let rule = |manifest: Value, components: &[Option<CredentialStatus>]| {
+            compose_policy(&manifest, components).unwrap_err().0
+        };
+        let two = ["componentOf", "componentOf"];
+
+        assert_eq!(
+            rule(
+                composite(honest_actions(), &two),
+                &[valid, Some(CredentialStatus::PresentInvalid)]
+            ),
+            "component_invalid"
+        );
+        assert_eq!(
+            rule(composite(honest_actions(), &two), &[valid, None]),
+            "component_invalid"
+        );
+        assert_eq!(
+            rule(
+                composite(honest_actions(), &two),
+                &[
+                    Some(CredentialStatus::Absent),
+                    Some(CredentialStatus::Absent)
+                ]
+            ),
+            "component_unsigned"
+        );
+        assert_eq!(
+            rule(composite(honest_actions(), &two), &[valid]),
+            "ingredient_mismatch"
+        );
+        assert_eq!(
+            rule(composite(honest_actions(), &[]), &[]),
+            "ingredient_mismatch"
+        );
+        assert_eq!(
+            rule(
+                composite(honest_actions(), &["parentOf", "parentOf"]),
+                &[valid, valid]
+            ),
+            "ingredient_mismatch"
+        );
+        assert_eq!(
+            rule(composite(honest_actions(), &["inputTo"]), &[valid]),
+            "ingredient_mismatch"
+        );
+        assert_eq!(
+            rule(
+                composite(json!([{"action": "c2pa.created"}]), &["componentOf"]),
+                &[valid]
+            ),
+            "generator_changed"
+        );
+        assert_eq!(
+            rule(
+                composite(
+                    json!([{"action": "c2pa.created", "digitalSourceType": "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"}]),
+                    &["componentOf"]
+                ),
+                &[valid]
+            ),
+            "generator_changed"
+        );
+        assert_eq!(
+            rule(
+                composite(
+                    json!([{"action": "c2pa.placed", "digitalSourceType": COMPOSITE_SOURCE_TYPE}]),
+                    &["componentOf"]
+                ),
+                &[valid]
+            ),
+            "generator_changed"
+        );
+        assert_eq!(
+            rule(
+                composite(json!([{"action": "c2pa.transcoded"}]), &["componentOf"]),
+                &[valid]
+            ),
+            "action_not_allowed"
+        );
+        assert_eq!(
+            rule(
+                composite(
+                    json!([{"action": "c2pa.placed", "softwareAgent": "Other Tool"}]),
+                    &["componentOf"]
+                ),
+                &[valid]
+            ),
+            "generator_changed"
+        );
+        assert_eq!(
+            rule(
+                composite(json!([{"action": "c2pa.placed"}]), &["componentOf"]),
+                &[valid]
+            ),
+            "action_not_allowed"
+        );
+        assert_eq!(
+            rule(
+                json!({"ingredients": [{"relationship": "componentOf"}]}),
+                &[valid]
+            ),
+            "action_not_allowed"
+        );
+        let mut extra = composite(honest_actions(), &["componentOf"]);
+        extra["assertions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"label": "stds.schema-org.CreativeWork"}));
+        assert_eq!(rule(extra, &[valid]), "assertion_not_allowed");
+    }
 
     fn placeholder() -> [u8; PLACEHOLDER_LEN] {
         new_placeholder().expect("random bytes")
@@ -1028,25 +1375,25 @@ mod tests {
 
     #[test]
     fn only_listed_actions_without_a_source_type_pass() {
-        assert!(actions_allowed(Some(
+        assert!(carry_actions(Some(
             &json!({"actions": [{"action": "c2pa.opened"}, {"action": "c2pa.transcoded"}]})
         ))
         .is_ok());
-        assert!(actions_allowed(None).is_ok());
+        assert!(carry_actions(None).is_ok());
         assert_eq!(
-            actions_allowed(Some(&json!({"actions": [{"action": "c2pa.created"}]})))
+            carry_actions(Some(&json!({"actions": [{"action": "c2pa.created"}]})))
                 .unwrap_err()
                 .0,
             "action_not_allowed"
         );
         assert_eq!(
-            actions_allowed(Some(&json!({"actions": [{}]})))
+            carry_actions(Some(&json!({"actions": [{}]})))
                 .unwrap_err()
                 .0,
             "action_not_allowed"
         );
         assert_eq!(
-            actions_allowed(Some(
+            carry_actions(Some(
                 &json!({"actions": [{"action": "c2pa.opened", "digitalSourceType": "x"}]})
             ))
             .unwrap_err()
@@ -1059,7 +1406,7 @@ mod tests {
             json!(7),
         ] {
             assert_eq!(
-                actions_allowed(Some(
+                carry_actions(Some(
                     &json!({"actions": [{"action": "c2pa.resized", "softwareAgent": agent}]})
                 ))
                 .unwrap_err()
@@ -1072,7 +1419,7 @@ mod tests {
             json!("c2pa-check 0.1"),
             Value::Null,
         ] {
-            assert!(actions_allowed(Some(
+            assert!(carry_actions(Some(
                 &json!({"actions": [{"action": "c2pa.resized", "softwareAgent": agent}]})
             ))
             .is_ok());
@@ -1095,13 +1442,14 @@ mod tests {
 
     #[test]
     fn the_policy_accepts_one_valid_parent_and_listed_assertions() {
-        assert!(policy(Some(&store_with(honest_manifest())), "urn:source", true).is_ok());
+        assert!(carry_policy(Some(&store_with(honest_manifest())), "urn:source", true).is_ok());
     }
 
     #[test]
     fn the_policy_names_the_rule_each_violation_breaks() {
-        let rule =
-            |store: Option<&Value>, valid: bool| policy(store, "urn:source", valid).unwrap_err().0;
+        let rule = |store: Option<&Value>, valid: bool| {
+            carry_policy(store, "urn:source", valid).unwrap_err().0
+        };
         let mut extra_assertion = honest_manifest();
         extra_assertion["assertions"]
             .as_array_mut()
@@ -1133,7 +1481,7 @@ mod tests {
         );
         assert_eq!(
             rule(
-                Some(&json!({"active_manifest": "urn:source", "manifests": {}})),
+                Some(&json!({"active_manifest": "urn:source", "manifests": {"urn:source": {}}})),
                 true
             ),
             "ingredient_mismatch"

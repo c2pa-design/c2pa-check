@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use base64::Engine as _;
 use c2pa_check_core::carry::{
-    self, CarryError, CarryOptions, CarryOutcome, DeferredSigner, LocalIdentity, PLACEHOLDER_LEN,
+    self, CarryError, CarryOptions, CarryOutcome, ComposeOutcome, DeferredSigner, LocalIdentity,
+    PLACEHOLDER_LEN,
 };
 use c2pa_check_core::media::mime_from_extension;
 use c2pa_check_core::report::CredentialStatus;
@@ -456,21 +457,34 @@ fn compose_inner(
         .map(|(bytes, mime, title)| carry::Component { bytes, mime, title })
         .collect();
 
-    if let Mode::Hosted { .. } = context.mode {
-        item.warnings.push(format!(
-            "hosted signing does not accept composites yet; signed with a local key. {SIGNER_HINT}"
-        ));
-    }
-    let (signer, mode) = local_signer(context, item)?;
     let title = file_title(output_path);
-    let outcome = carry::compose(
-        &components,
-        &output,
+    let work = Composite {
+        components: &components,
+        output: &output,
         output_mime,
         edited,
-        title.as_deref(),
-        signer.as_ref(),
-    )?;
+        title: title.as_deref(),
+    };
+    let hosted = match &context.mode {
+        Mode::Hosted { base, key } => match hosted_compose(context, base, key, &work, item) {
+            Ok(done) => Some(done),
+            Err(Hosted::Fallback(reason)) => {
+                item.warnings.push(format!(
+                    "hosted signing unavailable ({reason}); signed with a local key. {SIGNER_HINT}"
+                ));
+                None
+            }
+            Err(Hosted::Failure(failure)) => return Err(failure),
+        },
+        _ => None,
+    };
+    let (outcome, mode) = match hosted {
+        Some(outcome) => (outcome, "hosted"),
+        None => {
+            let (signer, mode) = local_signer(context, item)?;
+            (work.compose(signer.as_ref())?, mode)
+        }
+    };
     let unsigned = components.len() - outcome.components_with_credentials;
     if unsigned > 0 {
         item.warnings.push(format!(
@@ -484,6 +498,30 @@ fn compose_inner(
     item.signer_mode = Some(mode);
     item.actions = outcome.actions;
     Ok(())
+}
+
+struct Composite<'a> {
+    components: &'a [carry::Component<'a>],
+    output: &'a [u8],
+    output_mime: &'a str,
+    edited: bool,
+    title: Option<&'a str>,
+}
+
+impl Composite<'_> {
+    fn compose(
+        &self,
+        signer: &dyn c2pa_check_core::c2pa::Signer,
+    ) -> Result<ComposeOutcome, CarryError> {
+        carry::compose(
+            self.components,
+            self.output,
+            self.output_mime,
+            self.edited,
+            self.title,
+            signer,
+        )
+    }
 }
 
 fn verify_and_write(
@@ -669,10 +707,7 @@ fn local_identity_signer(context: &Run<'_>, item: &mut Item) -> Result<BoxedSign
 }
 
 fn identity_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|base| base.join("c2pa-check").join("identity"))
+    env::config_dir().map(|dir| dir.join("identity"))
 }
 
 fn load_or_create_identity(item: &mut Item) -> Result<LocalIdentity, Failure> {
@@ -715,7 +750,7 @@ fn save_identity(dir: &Path, identity: &LocalIdentity) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
 
     let mut options = std::fs::OpenOptions::new();
@@ -781,6 +816,56 @@ fn hosted(
     let outcome = pair
         .carry(&signer, options)
         .map_err(|e| Hosted::Failure(e.into()))?;
+    let pending = Pending {
+        source: Some((pair.source, pair.source_mime)),
+        bytes: &outcome.bytes,
+        mime: pair.derived_mime,
+        signer_name,
+    };
+    let bytes = countersign(base, key, &signer, &pending, item)?;
+
+    Ok(CarryOutcome { bytes, ..outcome })
+}
+
+fn hosted_compose(
+    context: &Run<'_>,
+    base: &str,
+    key: &str,
+    work: &Composite<'_>,
+    item: &mut Item,
+) -> Result<ComposeOutcome, Hosted> {
+    let (chain, signer_name) = certificate(context, base, key)?;
+
+    let placeholder = carry::new_placeholder().map_err(|e| Hosted::Failure(e.into()))?;
+    let signer = DeferredSigner::new(chain, placeholder);
+    let outcome = work
+        .compose(&signer)
+        .map_err(|e| Hosted::Failure(e.into()))?;
+    let pending = Pending {
+        source: None,
+        bytes: &outcome.bytes,
+        mime: work.output_mime,
+        signer_name,
+    };
+    let bytes = countersign(base, key, &signer, &pending, item)?;
+
+    Ok(ComposeOutcome { bytes, ..outcome })
+}
+
+struct Pending<'a> {
+    source: Option<(&'a [u8], &'a str)>,
+    bytes: &'a [u8],
+    mime: &'a str,
+    signer_name: Option<String>,
+}
+
+fn countersign(
+    base: &str,
+    key: &str,
+    signer: &DeferredSigner,
+    pending: &Pending<'_>,
+    item: &mut Item,
+) -> Result<Vec<u8>, Hosted> {
     let tbs = signer.take_tbs().ok_or_else(|| {
         Hosted::Failure(Failure::Error(anyhow!(
             "the manifest was built without a signature request"
@@ -788,20 +873,23 @@ fn hosted(
     })?;
 
     let boundary = boundary().map_err(|e| Hosted::Failure(Failure::Error(e)))?;
-    let mut body = Vec::with_capacity(pair.source.len() + outcome.bytes.len() + tbs.len() + 1024);
-    part(
-        &mut body,
-        &boundary,
-        "source",
-        Some(("source", pair.source_mime)),
-        pair.source,
-    );
+    let source_len = pending.source.map_or(0, |(bytes, _)| bytes.len());
+    let mut body = Vec::with_capacity(source_len + pending.bytes.len() + tbs.len() + 1024);
+    if let Some((source, mime)) = pending.source {
+        part(
+            &mut body,
+            &boundary,
+            "source",
+            Some(("source", mime)),
+            source,
+        );
+    }
     part(
         &mut body,
         &boundary,
         "derived",
-        Some(("derived", pair.derived_mime)),
-        &outcome.bytes,
+        Some(("derived", pending.mime)),
+        pending.bytes,
     );
     part(
         &mut body,
@@ -832,7 +920,7 @@ fn hosted(
         .and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok())
         .filter(|s| s.len() == PLACEHOLDER_LEN)
         .ok_or_else(|| Hosted::Fallback("the signing response had no signature".into()))?;
-    let bytes = carry::patch_placeholder(&outcome.bytes, signer.placeholder(), &signature)
+    let bytes = carry::patch_placeholder(pending.bytes, signer.placeholder(), &signature)
         .map_err(|e| Hosted::Failure(Failure::Error(anyhow!(e))))?;
 
     item.signer_mode = Some("hosted");
@@ -845,8 +933,9 @@ fn hosted(
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
-        .or(signer_name);
-    Ok(CarryOutcome { bytes, ..outcome })
+        .or_else(|| pending.signer_name.clone());
+
+    Ok(bytes)
 }
 
 type Certificate = (Vec<Vec<u8>>, Option<String>);
@@ -1507,6 +1596,152 @@ mod tests {
             .verify(&carried.unwrap(), "image/webp", &Options::default())
             .unwrap();
         assert_eq!(report.ingredients.len(), 1);
+    }
+
+    fn hosted_context<'a>(verifier: &'a Verifier, base: String) -> Run<'a> {
+        Run {
+            verifier,
+            mode: Mode::Hosted {
+                base,
+                key: "c2pa_test_key".into(),
+            },
+            tsa: None,
+            force: false,
+            local: Mutex::new(None),
+            chain: Mutex::new(None),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn atlas_inputs(name: &str) -> (PathBuf, [PathBuf; 2]) {
+        let dir = scratch(name);
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("a.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("b.png"),
+            encoded(&picture(), image::ImageFormat::Png),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("atlas.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let sources = [dir.join("a.png"), dir.join("b.png")];
+
+        (dir, sources)
+    }
+
+    #[test]
+    fn a_hosted_composite_is_sent_without_a_source_and_passes_the_hosted_policy() {
+        use c2pa::Signer as _;
+
+        let organization = carry::generate_identity("acme.example via c2pa.design").unwrap();
+        let (chain_pem, key_pem) = (organization.chain_pem.clone(), organization.key_pem.clone());
+        let (seen, sent) = std::sync::mpsc::channel();
+        let (base, server) = serve(2, move |request| {
+            if request.path.ends_with("/sign/certificate") {
+                return (
+                    200,
+                    serde_json::json!({"certificate_chain": [chain_pem], "signer_name": "acme.example via c2pa.design"})
+                        .to_string(),
+                );
+            }
+            let boundary = request
+                .content_type
+                .split("boundary=")
+                .nth(1)
+                .unwrap_or_default();
+            let signature = carry::local_signer(&chain_pem, &key_pem, None)
+                .unwrap()
+                .sign(multipart_field(&request.body, boundary, "tbs"))
+                .unwrap();
+            let placeholder =
+                hex::decode(multipart_field(&request.body, boundary, "placeholder")).unwrap();
+            seen.send((
+                String::from_utf8_lossy(&request.body).contains("name=\"source\""),
+                multipart_field(&request.body, boundary, "derived").to_vec(),
+                placeholder,
+                signature.clone(),
+            ))
+            .unwrap();
+            (
+                200,
+                serde_json::json!({
+                    "signature": base64::engine::general_purpose::STANDARD.encode(signature),
+                    "carry_id": "carry_2",
+                    "signer_name": "acme.example via c2pa.design"
+                })
+                .to_string(),
+            )
+        });
+        let (dir, sources) = atlas_inputs("hosted-compose");
+        let verifier = no_trust_verifier();
+
+        let item = compose_one(
+            &hosted_context(&verifier, base),
+            &sources,
+            &dir.join("atlas.webp"),
+            &dir.join("signed.webp"),
+            false,
+        );
+        let paths = server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let (had_source, pending, placeholder, signature) = sent.recv().unwrap();
+        let verdict = verifier.compose_check(
+            &carry::ComposeInput {
+                composite: &pending,
+                mime: "image/webp",
+                placeholder: &placeholder,
+                signature: &signature,
+            },
+            &Options::default(),
+        );
+
+        assert_eq!(item.status, "composed", "{:?}", item.message);
+        assert_eq!(item.signer_mode, Some("hosted"));
+        assert_eq!(item.carry_id.as_deref(), Some("carry_2"));
+        assert_eq!(item.signer.as_deref(), Some("acme.example via c2pa.design"));
+        assert_eq!(
+            item.credential_status,
+            Some(CredentialStatus::ValidUntrusted)
+        );
+        assert_eq!(paths, ["/v1/sign/certificate", "/v1/sign"]);
+        assert!(!had_source);
+        assert!(verdict.accepted, "{} {}", verdict.rule, verdict.detail);
+    }
+
+    #[test]
+    fn a_composite_falls_back_to_the_local_key_when_hosted_signing_is_not_available() {
+        let (base, server) = serve(1, |_| {
+            (
+                403,
+                r#"{"error":{"code":"signing_disabled","message":"needs a verified domain","retryable":false}}"#
+                    .to_string(),
+            )
+        });
+        let (dir, sources) = atlas_inputs("hosted-compose-fallback");
+        let verifier = no_trust_verifier();
+        let mut context = hosted_context(&verifier, base);
+        context.local = Mutex::new(Some(carry::generate_identity("local").unwrap()));
+
+        let item = compose_one(
+            &context,
+            &sources,
+            &dir.join("atlas.webp"),
+            &dir.join("signed.webp"),
+            false,
+        );
+        server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(item.status, "composed", "{:?}", item.message);
+        assert_eq!(item.signer_mode, Some("local"));
+        assert!(
+            item.warnings.iter().any(|w| w.contains("signing_disabled")),
+            "{:?}",
+            item.warnings
+        );
     }
 
     #[test]

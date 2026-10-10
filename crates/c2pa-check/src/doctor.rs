@@ -14,11 +14,23 @@ pub const MIN_NODE_MAJOR: u32 = 18;
 const EXIT_FAILED: u8 = 1;
 const MAX_BODY_BYTES: u64 = 64 * 1024;
 const KEY_PREVIEW_LEN: usize = 14;
+const SKILL_URL: &str = "https://c2pa.design/skills/c2pa-integrate/SKILL.md";
+const SKILL_PATH: &str = "skills/c2pa-integrate/SKILL.md";
+const SKILL_ROOTS: [&str; 2] = [".claude", ".agents"];
+const MAX_SKILL_BYTES: u64 = 512 * 1024;
 
 #[derive(Args)]
 pub struct DoctorArgs {
     #[arg(long, help = "print one JSON document")]
     json: bool,
+
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "CHECKS",
+        help = "checks that must be ok, e.g. --require api_key,webhook_secret: a warning or a skipped check then fails (exit 1)"
+    )]
+    require: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -53,6 +65,7 @@ struct Setup {
     key: Option<String>,
     webhook_secret: Option<String>,
     node_version: Option<String>,
+    skill_url: String,
 }
 
 impl Setup {
@@ -62,6 +75,7 @@ impl Setup {
             key: env::api_key(),
             webhook_secret: env::value("C2PA_WEBHOOK_SECRET"),
             node_version: env::value("C2PA_CHECK_NODE_VERSION"),
+            skill_url: env::value("C2PA_SKILL_URL").unwrap_or_else(|| SKILL_URL.to_string()),
         }
     }
 }
@@ -77,7 +91,11 @@ fn diagnose(setup: &Setup) -> Vec<Check> {
 
 pub fn run(args: &DoctorArgs) -> anyhow::Result<u8> {
     let setup = Setup::from_env();
-    let checks = diagnose(&setup);
+    let mut checks = diagnose(&setup);
+    checks.push(skill(&installed_skills(), || {
+        latest_skill(&setup.skill_url)
+    }));
+    require(&mut checks, &args.require)?;
     let failed = checks.iter().any(|c| c.state == State::Fail);
     if args.json {
         println!(
@@ -320,6 +338,83 @@ fn webhook_secret(secret: Option<&str>) -> Check {
     }
 }
 
+fn require(checks: &mut [Check], names: &[String]) -> anyhow::Result<()> {
+    for name in names {
+        let Some(found) = checks.iter_mut().find(|c| c.name == name) else {
+            anyhow::bail!(
+                "--require {name}: no such check (api_key, network, whoami, webhook_secret, node, skill)"
+            );
+        };
+        if found.state != State::Ok {
+            found.state = State::Fail;
+            found.detail = format!("required: {}", found.detail);
+        }
+    }
+
+    Ok(())
+}
+
+fn skill_version(text: &str) -> Option<u32> {
+    text.lines()
+        .take_while(|line| !line.starts_with('#'))
+        .find_map(|line| line.trim().strip_prefix("version:"))
+        .and_then(|v| v.trim().trim_matches(['"', '\'']).parse().ok())
+}
+
+fn installed_skills() -> Vec<(String, u32)> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let bases = [Some(std::path::PathBuf::from(".")), home];
+
+    bases
+        .iter()
+        .flatten()
+        .flat_map(|base| SKILL_ROOTS.map(|root| base.join(root).join(SKILL_PATH)))
+        .filter_map(|path| {
+            let version = skill_version(&std::fs::read_to_string(&path).ok()?)?;
+            Some((path.display().to_string(), version))
+        })
+        .collect()
+}
+
+fn latest_skill(url: &str) -> Option<u32> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(TIMEOUT))
+        .build()
+        .into();
+    let bytes = agent
+        .get(url)
+        .call()
+        .ok()?
+        .body_mut()
+        .with_config()
+        .limit(MAX_SKILL_BYTES)
+        .read_to_vec()
+        .ok()?;
+
+    skill_version(&String::from_utf8_lossy(&bytes))
+}
+
+fn skill(installed: &[(String, u32)], latest: impl FnOnce() -> Option<u32>) -> Check {
+    if installed.is_empty() {
+        return check("skill", State::Skip, "c2pa-integrate is not installed here");
+    }
+    let Some(latest) = latest() else {
+        return check(
+            "skill",
+            State::Skip,
+            "the latest skill version could not be fetched",
+        );
+    };
+    match installed.iter().find(|(_, version)| *version < latest) {
+        Some((path, version)) => check(
+            "skill",
+            State::Warn,
+            format!("{path} is version {version}, version {latest} is out: npx skills update c2pa-integrate"),
+        ),
+        None => check("skill", State::Ok, format!("c2pa-integrate version {latest}")),
+    }
+}
+
 fn node(version: Option<&str>) -> Check {
     let Some(version) = version else {
         return check("node", State::Skip, "not run through npx");
@@ -356,6 +451,7 @@ mod tests {
             key,
             webhook_secret: None,
             node_version: None,
+            skill_url: String::new(),
         }
     }
 
@@ -542,6 +638,38 @@ mod tests {
         );
         assert_eq!(webhook_secret(Some("plainsecret")).state, State::Fail);
         assert_eq!(webhook_secret(Some("whsec_not base64!")).state, State::Fail);
+    }
+
+    #[test]
+    fn a_required_check_that_only_warns_or_was_skipped_fails() {
+        let mut checks = vec![key_format(None), webhook_secret(None), node(Some("22.0.0"))];
+
+        require(
+            &mut checks,
+            &["api_key".into(), "webhook_secret".into(), "node".into()],
+        )
+        .unwrap();
+        let unknown = require(&mut checks, &["nope".into()]);
+
+        assert_eq!(checks[0].state, State::Fail);
+        assert!(checks[0].detail.starts_with("required: "));
+        assert_eq!(checks[1].state, State::Fail);
+        assert_eq!(checks[2].state, State::Ok);
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn an_installed_skill_older_than_the_published_one_warns() {
+        let text = "---\nname: c2pa-integrate\nmetadata:\n  version: \"2\"\n---\n# c2pa-integrate\nversion: 9\n";
+        let old = vec![(".claude/skills/c2pa-integrate/SKILL.md".to_string(), 2)];
+
+        assert_eq!(skill_version(text), Some(2));
+        assert_eq!(skill_version("# no frontmatter"), None);
+        assert_eq!(skill(&old, || Some(3)).state, State::Warn);
+        assert!(skill(&old, || Some(3)).detail.contains("npx skills update"));
+        assert_eq!(skill(&old, || Some(2)).state, State::Ok);
+        assert_eq!(skill(&old, || None).state, State::Skip);
+        assert_eq!(skill(&[], || Some(3)).state, State::Skip);
     }
 
     #[test]

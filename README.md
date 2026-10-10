@@ -36,10 +36,10 @@ to the check command. JUnit marks every target that is not `valid_trusted` as a 
 | Exit | Meaning |
 |---|---|
 | `0` | pass |
-| `1` | expectation or coverage failed · `doctor` found a failing check · `carry --strict` found an unpaired file |
+| `1` | expectation, coverage or baseline failed · `apply --wait` ended with a domain pending · `doctor` found a failing check · `carry --strict` found an unpaired file |
 | `2` | usage or I/O error |
 | `3` | unreadable asset (missing or unreadable local file, over 64 MiB, malformed manifest) |
-| `4` | a URL could not be fetched |
+| `4` | a URL could not be fetched · `register` could not reach the API |
 | `5` | `carry` refused (rule in `--json`) |
 
 ## Check your setup
@@ -64,6 +64,46 @@ ok    node            Node.js 22.11.0
 `doctor --json` prints `{ok, api_base, checks: [{name, state, detail, data?}]}` with `state`
 `ok | warn | fail | skip`; the `whoami` check carries the API answer in `data`.
 
+## One file, no scripts
+
+`c2pa.json` at the repository root (every section optional, unknown keys are errors):
+
+```json
+{
+  "checks": [
+    { "name": "shipped", "paths": ["public/**/*.{jpg,png,webp}"], "baseline": "c2pa-baseline.json" },
+    { "name": "sources", "paths": ["design/**/*.png"], "coverage": 39, "git_tracked": true }
+  ],
+  "webhooks": [{ "url": "https://hooks.example.com/c2pa", "events": ["asset.lost", "monitor.regression"] }],
+  "monitors": [{ "name": "CDN", "schedule": "hourly", "checkpoints": [{ "name": "hero", "url": "https://cdn.example.com/hero.jpg", "expect": "present_trusted" }] }],
+  "domains": ["example.com"]
+}
+```
+
+```bash
+c2pa-check                      # every check, each with its own threshold; names the one that failed
+c2pa-check --update-baseline    # write the baselines (path → status); commit them
+c2pa-check register             # check, POST /assets/sync, POST /assets for new hashes only
+c2pa-check apply --ping         # webhooks by URL, monitors by name, domains by host; deletes nothing
+c2pa-check doctor --require api_key,webhook_secret
+```
+
+| Flag | Meaning |
+|---|---|
+| `--baseline PATH` | fail when a file that had a valid credential in the baseline has lost it |
+| `--git-tracked` | only files git tracks, so local and CI runs count the same set |
+| `--format F --output P` (repeatable) | several reports from one run, paired by position |
+| `--register` | register the checked files after the gate |
+| `apply --secret-out PATH` | keep the webhook secret in a file (created once, owner-only, never printed) instead of `C2PA_WEBHOOK_SECRET` |
+| `apply --wait SECONDS` | keep checking domain ownership; exit `1` if still pending |
+
+Without `c2pa.json`, pass targets and flags as before.
+
+**Error reports.** When a command ends with an error (exit 2–5 or a crash) c2pa-check sends
+`{version, os, arch, command, exit_code, code, mime, ci}` to `POST /cli-reports` from a detached
+process (the command does not wait for it) and prints what it sends. No file names, paths, URLs, hashes or keys, and no API key. `C2PA_TELEMETRY=0`,
+`DO_NOT_TRACK=1` or `--offline` turn it off.
+
 ## In CI
 
 ```yaml
@@ -75,13 +115,13 @@ ok    node            Node.js 22.11.0
     output: c2pa-check.xml
 ```
 
-The action installs the release named by `version` (default `v0.2.0`) and checks it against the
+The action installs the release named by `version` (default `v0.3.0`) and checks it against the
 release's `SHA256SUMS` before running it. Every release publishes `SHA256SUMS` and a GitHub
 build-provenance attestation (`gh attestation verify c2pa-check-<target>.tar.gz -R
 c2pa-design/c2pa-check`); the npm packages are published with npm provenance
 (`npm audit signatures`).
 
-Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.2.0`
+Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.3.0`
 (`node:22-bookworm-slim` is the smallest that also has the glibc tools most pipelines expect;
 the binary itself is static musl, so `node:22-alpine` works too). Pin the version so `npx` hits
 its cache instead of resolving `latest` on every run, and cache `~/.npm` between jobs; or skip
@@ -142,9 +182,12 @@ c2pa-check carry --compose base.png logo.png --to banner.webp --edited   # base.
 ```
 
 `--edited` records `c2pa.opened` on the first source (as `parentOf`), `c2pa.edited`, and
-`c2pa.placed` for the rest. Composites are signed with `C2PA_SIGN_CERT` / `C2PA_SIGN_KEY` or
-the local key; hosted signing does not accept composites yet, so with only an API key the
-composite is signed locally and `carry` warns.
+`c2pa.placed` for the rest. The signer order is the same as for a carry. With an API key
+c2pa.design signs a composite for an organization with a verified domain when every component
+credential validates and at least one source has one (refusals: `component_invalid`,
+`component_unsigned`, `ingredient_mismatch`, `action_not_allowed`, `generator_changed`). Without
+a verified domain the composite is signed with the local key and `carry` warns. That the pixels
+come from the listed sources is your statement; c2pa.design vouches for the account.
 
 ## For AI agents
 

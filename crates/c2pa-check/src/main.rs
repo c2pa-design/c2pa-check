@@ -1,9 +1,16 @@
+mod api;
+mod apply;
+mod baseline;
 mod carry_cmd;
+mod config;
 mod doctor;
 mod env;
 mod fetch;
+mod login;
 mod mcp;
 mod output;
+mod register;
+mod telemetry;
 #[cfg(test)]
 mod test_server;
 mod trust_cmd;
@@ -19,6 +26,7 @@ const EXIT_EXPECTATION: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_PARSE: u8 = 3;
 const EXIT_NETWORK: u8 = 4;
+const EXIT_CRASH: u8 = 101;
 
 #[derive(Parser)]
 #[command(
@@ -38,21 +46,59 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     trust_anchors: Option<PathBuf>,
 
-    #[arg(long, value_enum, default_value_t = Format::Text)]
-    format: Format,
+    #[arg(
+        long,
+        value_enum,
+        help = "report format, text by default; repeat with --output for several reports from one run"
+    )]
+    format: Vec<Format>,
 
     #[arg(
         long,
         value_name = "PATH",
-        help = "write the report to PATH instead of stdout (e.g. --format junit --output c2pa-check.xml)"
+        help = "write the report to PATH instead of stdout; the Nth --output takes the Nth --format \
+(--format json --output a.json --format junit --output a.xml)"
     )]
-    output: Option<PathBuf>,
+    output: Vec<PathBuf>,
 
     #[arg(long, value_enum)]
     expect: Option<Expect>,
 
     #[arg(long, value_name = "PCT")]
     coverage: Option<f64>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "fail when a file that had a valid credential in this baseline has lost it"
+    )]
+    baseline: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "write the baseline (--baseline, or each check's in c2pa.json) instead of comparing"
+    )]
+    update_baseline: bool,
+
+    #[arg(
+        long,
+        help = "only check files git tracks, so local and CI runs count the same set"
+    )]
+    git_tracked: bool,
+
+    #[arg(
+        long,
+        help = "after the check, register the files with c2pa.design (POST /assets/sync, then /assets for new hashes); needs C2PA_API_KEY"
+    )]
+    register: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "settings file; ./c2pa.json is read when present and no TARGET is given"
+    )]
+    config: Option<PathBuf>,
 
     #[arg(long)]
     raw: bool,
@@ -98,13 +144,52 @@ certificate, or *_FILE paths); C2PA_API_KEY (or the deprecated C2PA_DESIGN_API_K
 c2pa.design, falls back to a local key if unavailable); otherwise a local key kept in \
 ~/.config/c2pa-check/identity.\n\nComposites: --compose A B ... --to OUTPUT signs OUTPUT as a \
 new work (c2pa.created, or c2pa.edited with --edited) with every source attached as a \
-componentOf ingredient. Hosted signing does not accept composites yet, so they are signed \
-with your own certificate or the local key.\n\nExit codes: 0 carried and verified, 1 \
+componentOf ingredient. With C2PA_API_KEY and a verified domain c2pa.design signs it when \
+every component credential validates and at least one source has one; otherwise it is signed \
+with the local key and a warning.\n\nExit codes: 0 carried and verified, 1 \
 --strict and a file has no or an ambiguous original, 2 usage or I/O error, 5 refused (rule in \
 --json: different_picture, source_unsigned, low_quality, not_comparable, or the rule \
 c2pa.design returned with carry_rejected)."
     )]
     Carry(carry_cmd::CarryArgs),
+    #[command(
+        about = "Register files with c2pa.design: check, sync hashes, send only the new ones",
+        long_about = "Check the files, ask c2pa.design which sha256 hashes it does not know \
+(POST /assets/sync, 5000 per call) and register only those (POST /assets, 500 per call) with \
+the file path as location. Bytes never leave the machine. Without TARGET the paths of every \
+check in c2pa.json are used. Retries follow error.retryable and Retry-After, five attempts.\n\n\
+Exit codes: 0 registered, 2 usage, 3 a file could not be read, 4 the API call failed."
+    )]
+    Register {
+        #[arg(value_name = "TARGET")]
+        targets: Vec<String>,
+        #[arg(long, help = "only files git tracks")]
+        git_tracked: bool,
+    },
+    #[command(
+        about = "Make the account match c2pa.json: webhooks, monitors, domains",
+        long_about = "Create or update what c2pa.json declares; safe to run on every deploy. \
+Webhooks are matched by URL (PUT /webhooks), monitors by name, domains by host. Nothing is \
+deleted. The webhook secret comes from C2PA_WEBHOOK_SECRET or the --secret-out file and is \
+never printed; a changed secret is rotated in with a 24-hour overlap.\n\n\
+Exit codes: 0 applied, 1 --wait ended with a domain still pending, 2 usage or API error."
+    )]
+    Apply(apply::ApplyArgs),
+    #[command(
+        about = "Sign in from a terminal: approve a code in the browser, get an API key",
+        long_about = "Prints a link and a short code. Open the link on any device, sign in to \
+c2pa.design and approve the code; a new API key is then saved in \
+~/.config/c2pa-check/credentials (owner-only) and used whenever C2PA_API_KEY is not set. The key \
+is never printed. --ci github|gitlab also stores it as the C2PA_API_KEY secret of the current \
+repository through the gh or glab CLI.\n\nFor a person at a terminal only: a Docker build or a \
+CI job cannot approve a code and takes the key from its secret store.\n\n\
+Exit codes: 0 signed in, 1 the code was not approved in time, 2 usage or API error."
+    )]
+    Login(login::LoginArgs),
+    #[command(hide = true, name = telemetry::SEND_COMMAND)]
+    ReportSend {
+        body: String,
+    },
     #[command(
         about = "Write a certificate chain and private key for C2PA_SIGN_CERT / C2PA_SIGN_KEY"
     )]
@@ -130,32 +215,64 @@ impl From<TrustArg> for TrustSelector {
     }
 }
 
-#[derive(Copy, Clone, ValueEnum)]
+#[derive(Copy, Clone, Default, ValueEnum)]
 enum Format {
+    #[default]
     Text,
     Json,
     Ndjson,
     Junit,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum Expect {
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Expect {
     Present,
     Trusted,
     Absent,
 }
 
+fn command_name(command: Option<&Command>) -> &'static str {
+    match command {
+        None => "check",
+        Some(Command::Inspect { .. }) => "inspect",
+        Some(Command::Trust { .. }) => "trust",
+        Some(Command::Completions { .. }) => "completions",
+        Some(Command::Mcp) => "mcp",
+        Some(Command::Doctor(_)) => "doctor",
+        Some(Command::Carry(_)) => "carry",
+        Some(Command::Keygen(_)) => "keygen",
+        Some(Command::Register { .. }) => "register",
+        Some(Command::Apply(_)) => "apply",
+        Some(Command::Login(_)) => "login",
+        Some(Command::ReportSend { .. }) => telemetry::SEND_COMMAND,
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let (command, offline) = (command_name(cli.command.as_ref()), cli.offline);
+    telemetry::panic_hook();
 
-    match run(cli) {
-        Ok(code) => ExitCode::from(code),
-        Err(err) => {
+    let code = match std::panic::catch_unwind(|| run(cli)) {
+        Ok(Ok(code)) => code,
+        Ok(Err(err)) => {
             eprintln!("c2pa-check: {err}");
+            if let Some(api) = err.downcast_ref::<api::ApiError>() {
+                telemetry::note(&format!("api.{}.{}", api.status, api.code));
+            }
 
-            ExitCode::from(EXIT_USAGE)
+            EXIT_USAGE
         }
+        Err(_) => EXIT_CRASH,
+    };
+    let silent = matches!(code, 0 | EXIT_EXPECTATION)
+        || matches!(command, "doctor" | "mcp" | telemetry::SEND_COMMAND);
+    if !silent {
+        telemetry::report(command, code, offline);
     }
+
+    ExitCode::from(code)
 }
 
 fn run(mut cli: Cli) -> anyhow::Result<u8> {
@@ -176,62 +293,280 @@ fn run(mut cli: Cli) -> anyhow::Result<u8> {
 
             return carry_cmd::run(args, &verifier);
         }
+        Some(Command::Login(args)) => return login::run(&args),
+        Some(Command::ReportSend { body }) => {
+            telemetry::send(&body);
+
+            return Ok(0);
+        }
+        Some(Command::Apply(args)) => {
+            if skipped_without_key(env::api_key().as_deref(), "apply") {
+                return Ok(0);
+            }
+
+            return apply::run(&args, &config::require(cli.config.as_deref())?);
+        }
+        Some(Command::Register {
+            targets,
+            git_tracked,
+        }) => {
+            if skipped_without_key(env::api_key().as_deref(), "register") {
+                return Ok(0);
+            }
+            cli.targets = targets;
+            cli.git_tracked |= git_tracked;
+            let mut sets = sets(&cli)?;
+            for set in &mut sets {
+                set.expect = None;
+                set.coverage = None;
+                set.baseline = None;
+            }
+            let checked = check(&cli, &sets)?;
+            let registered = register(&checked.results)?;
+
+            return Ok(checked.read_failure().unwrap_or(registered));
+        }
         None => {}
     }
 
-    if cli.targets.is_empty() {
-        eprintln!("c2pa-check: give at least one file, glob or URL (--help for usage)");
+    let reports = reports(&cli.format, &cli.output)?;
+    let sets = sets(&cli)?;
+    let checked = check(&cli, &sets)?;
 
-        return Ok(EXIT_USAGE);
+    for (format, path) in reports {
+        write_report(format, &checked.results, path)?;
+    }
+    for failure in &checked.failures {
+        eprintln!("c2pa-check: {failure}");
+    }
+    let registered = if cli.register {
+        register(&checked.results)?
+    } else {
+        0
+    };
+
+    if let Some(code) = checked.read_failure() {
+        return Ok(code);
+    }
+    if !checked.failures.is_empty() {
+        return Ok(EXIT_EXPECTATION);
     }
 
-    let bundle = load_bundle(&cli)?;
+    Ok(registered)
+}
+
+struct Set {
+    name: String,
+    targets: Vec<String>,
+    expect: Option<Expect>,
+    coverage: Option<f64>,
+    baseline: Option<PathBuf>,
+    git_tracked: bool,
+}
+
+struct Checked {
+    results: Vec<(String, Option<Report>)>,
+    failures: Vec<String>,
+    network_failure: bool,
+    parse_failure: bool,
+}
+
+impl Checked {
+    fn read_failure(&self) -> Option<u8> {
+        if self.network_failure {
+            return Some(EXIT_NETWORK);
+        }
+
+        self.parse_failure.then_some(EXIT_PARSE)
+    }
+}
+
+fn sets(cli: &Cli) -> anyhow::Result<Vec<Set>> {
+    if !cli.targets.is_empty() {
+        return Ok(vec![Set {
+            name: String::new(),
+            targets: cli.targets.clone(),
+            expect: cli.expect,
+            coverage: cli.coverage,
+            baseline: cli.baseline.clone(),
+            git_tracked: cli.git_tracked,
+        }]);
+    }
+
+    let checks = config::load(cli.config.as_deref())?
+        .map(|c| c.checks)
+        .unwrap_or_default();
+    if checks.is_empty() {
+        anyhow::bail!(
+            "give at least one file, glob or URL, or list checks in {} (--help for usage)",
+            config::DEFAULT_PATH
+        );
+    }
+
+    Ok(checks
+        .into_iter()
+        .map(|c| Set {
+            name: c.name,
+            targets: c.paths,
+            expect: c.expect,
+            coverage: c.coverage,
+            baseline: c.baseline,
+            git_tracked: c.git_tracked || cli.git_tracked,
+        })
+        .collect())
+}
+
+fn reports<'a>(
+    formats: &[Format],
+    outputs: &'a [PathBuf],
+) -> anyhow::Result<Vec<(Format, Option<&'a Path>)>> {
+    match (formats.len(), outputs.len()) {
+        (_, 0) | (0, 1) => Ok(vec![(
+            formats.last().copied().unwrap_or_default(),
+            outputs.first().map(PathBuf::as_path),
+        )]),
+        (f, o) if f == o => Ok(formats
+            .iter()
+            .copied()
+            .zip(outputs.iter().map(|p| Some(p.as_path())))
+            .collect()),
+        (f, o) => anyhow::bail!("{f} --format and {o} --output: give one --format per --output"),
+    }
+}
+
+fn tracked() -> anyhow::Result<std::collections::HashSet<String>> {
+    let listed = std::process::Command::new("git")
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|err| anyhow::anyhow!("--git-tracked could not run git: {err}"))?;
+    if !listed.status.success() {
+        anyhow::bail!(
+            "--git-tracked needs a git work tree: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        );
+    }
+
+    Ok(listed
+        .stdout
+        .split(|b| *b == 0)
+        .map(|path| String::from_utf8_lossy(path).to_string())
+        .collect())
+}
+
+fn check(cli: &Cli, sets: &[Set]) -> anyhow::Result<Checked> {
+    let bundle = load_bundle(cli)?;
     let verifier = verifier_for(&bundle, cli.trust.into())?;
     let options = Options {
         include_raw: cli.raw,
         ..Options::default()
     };
+    let tracked = if sets.iter().any(|s| s.git_tracked) {
+        tracked()?
+    } else {
+        Default::default()
+    };
 
-    let targets = expand(&cli.targets)?;
-    let mut results = Vec::with_capacity(targets.len());
-    let mut network_failure = false;
-    let mut parse_failure = false;
+    let mut checked = Checked {
+        results: Vec::new(),
+        failures: Vec::new(),
+        network_failure: false,
+        parse_failure: false,
+    };
 
-    for target in &targets {
-        match load(target, cli.offline) {
-            Ok((bytes, mime)) => match verifier.verify(&bytes, &mime, &options) {
-                Ok(report) => results.push((target.clone(), Some(report))),
-                Err(err) => {
-                    eprintln!("{target}: {err}");
-                    parse_failure = true;
-                    results.push((target.clone(), None));
-                }
-            },
-            Err(err) => {
-                eprintln!("{target}: {err:#}");
-                if failure_exit(target) == EXIT_NETWORK {
-                    network_failure = true;
-                } else {
-                    parse_failure = true;
-                }
-                results.push((target.clone(), None));
+    for set in sets {
+        let mut targets = expand(&set.targets)?;
+        if set.git_tracked {
+            targets.retain(|t| is_url(t) || tracked.contains(t.trim_start_matches("./")));
+            if targets.is_empty() {
+                anyhow::bail!("{}: no file git tracks matched", set.targets.join(" "));
             }
         }
+
+        let first = checked.results.len();
+        for target in &targets {
+            match load(target, cli.offline) {
+                Ok((bytes, mime)) => match verifier.verify(&bytes, &mime, &options) {
+                    Ok(report) => checked.results.push((target.clone(), Some(report))),
+                    Err(err) => {
+                        eprintln!("{target}: {err}");
+                        telemetry::note(err.code());
+                        telemetry::note_mime(&mime);
+                        checked.parse_failure = true;
+                        checked.results.push((target.clone(), None));
+                    }
+                },
+                Err(err) => {
+                    eprintln!("{target}: {err:#}");
+                    if failure_exit(target) == EXIT_NETWORK {
+                        checked.network_failure = true;
+                    } else {
+                        checked.parse_failure = true;
+                    }
+                    checked.results.push((target.clone(), None));
+                }
+            }
+        }
+
+        let results = &checked.results[first..];
+        let label = if set.name.is_empty() {
+            String::new()
+        } else {
+            format!("{}: ", set.name)
+        };
+        let mut failures: Vec<String> = judge(results, set.expect, set.coverage)
+            .into_iter()
+            .map(|failure| format!("{label}{failure}"))
+            .collect();
+        if let Some(path) = &set.baseline {
+            if cli.update_baseline {
+                baseline::write(path, &baseline::snapshot(results))?;
+            } else {
+                failures.extend(
+                    baseline::regressions(&baseline::load(path)?, results)
+                        .into_iter()
+                        .map(|lost| format!("{label}credential lost since the baseline: {lost}")),
+                );
+            }
+        }
+        checked.failures.extend(failures);
     }
 
-    write_report(cli.format, &results, cli.output.as_deref())?;
+    Ok(checked)
+}
 
-    if network_failure {
-        return Ok(EXIT_NETWORK);
+fn skipped_without_key(key: Option<&str>, step: &str) -> bool {
+    if key.is_some() {
+        return false;
     }
-    if parse_failure {
-        return Ok(EXIT_PARSE);
-    }
-    if !meets_expectations(&results, cli.expect, cli.coverage) {
-        return Ok(EXIT_EXPECTATION);
-    }
+    eprintln!(
+        "c2pa-check: warning: C2PA_API_KEY is not set; skipped {step}, nothing was sent. \
+Run `c2pa-check login` or create a key at https://app.c2pa.design."
+    );
 
-    Ok(0)
+    true
+}
+
+fn register(results: &[(String, Option<Report>)]) -> anyhow::Result<u8> {
+    if skipped_without_key(env::api_key().as_deref(), "register") {
+        return Ok(0);
+    }
+    let api = api::Api::from_env()?;
+    match register::run(&api, results) {
+        Ok(done) => {
+            eprintln!(
+                "c2pa-check: {} distinct files, {} newly registered",
+                done.total, done.new
+            );
+
+            Ok(0)
+        }
+        Err(err) => {
+            eprintln!("c2pa-check: registering assets failed: {err}");
+            telemetry::note(&format!("api.{}.{}", err.status, err.code));
+
+            Ok(EXIT_NETWORK)
+        }
+    }
 }
 
 fn write_report(
@@ -368,33 +703,36 @@ fn braces(pattern: &str) -> Vec<String> {
         .collect()
 }
 
-fn meets_expectations(
+fn judge(
     results: &[(String, Option<Report>)],
     expect: Option<Expect>,
     coverage: Option<f64>,
-) -> bool {
+) -> Vec<String> {
     use c2pa_check_core::CredentialStatus as S;
 
+    let mut failures = Vec::new();
+
     if let Some(expect) = expect {
-        let ok = results.iter().all(|(_, report)| {
-            report.as_ref().is_some_and(|r| match expect {
-                Expect::Present => {
-                    matches!(r.credential.status, S::ValidTrusted | S::ValidUntrusted)
-                }
-                Expect::Trusted => r.credential.status == S::ValidTrusted,
-                Expect::Absent => r.credential.status == S::Absent,
+        let (want, word): (&[S], _) = match expect {
+            Expect::Present => (&[S::ValidTrusted, S::ValidUntrusted], "present"),
+            Expect::Trusted => (&[S::ValidTrusted], "trusted"),
+            Expect::Absent => (&[S::Absent], "absent"),
+        };
+        let off = results
+            .iter()
+            .filter(|(_, report)| {
+                !report
+                    .as_ref()
+                    .is_some_and(|r| want.contains(&r.credential.status))
             })
-        });
-        if !ok {
-            return false;
+            .count();
+        if off > 0 {
+            failures.push(format!("{off} of {} are not {word}", results.len()));
         }
     }
 
     if let Some(threshold) = coverage {
         let total = results.len();
-        if total == 0 {
-            return true;
-        }
         let trusted = results
             .iter()
             .filter(|(_, report)| {
@@ -403,13 +741,19 @@ fn meets_expectations(
                     .is_some_and(|r| r.credential.status == S::ValidTrusted)
             })
             .count();
-        let pct = trusted as f64 / total as f64 * 100.0;
+        let pct = if total == 0 {
+            100.0
+        } else {
+            trusted as f64 / total as f64 * 100.0
+        };
         if pct + f64::EPSILON < threshold {
-            return false;
+            failures.push(format!(
+                "coverage {pct:.1}% ({trusted} of {total} trusted) is below {threshold}"
+            ));
         }
     }
 
-    true
+    failures
 }
 
 #[cfg(test)]
@@ -445,6 +789,155 @@ mod tests {
             status,
         };
         r
+    }
+
+    fn meets_expectations(
+        results: &[(String, Option<Report>)],
+        expect: Option<Expect>,
+        coverage: Option<f64>,
+    ) -> bool {
+        judge(results, expect, coverage).is_empty()
+    }
+
+    #[test]
+    fn targets_on_the_command_line_are_one_set_carrying_the_flags() {
+        let cli = Cli::parse_from([
+            "c2pa-check",
+            "a.png",
+            "b.png",
+            "--coverage",
+            "80",
+            "--expect",
+            "trusted",
+            "--baseline",
+            "base.json",
+            "--git-tracked",
+        ]);
+
+        let got = sets(&cli).unwrap();
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].targets, ["a.png", "b.png"]);
+        assert_eq!(got[0].coverage, Some(80.0));
+        assert_eq!(got[0].expect, Some(Expect::Trusted));
+        assert_eq!(got[0].baseline.as_deref(), Some(Path::new("base.json")));
+        assert!(got[0].git_tracked && got[0].name.is_empty());
+    }
+
+    #[test]
+    fn checks_come_from_the_config_and_a_config_without_checks_is_a_usage_error() {
+        let dir = std::env::temp_dir().join(format!("c2pa-check-sets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (full, empty) = (dir.join("full.json"), dir.join("empty.json"));
+        std::fs::write(
+            &full,
+            r#"{"checks":[{"name":"shipped","paths":["public/*.webp"],"baseline":"b.json"},
+                          {"name":"sources","paths":["design/*.png"],"coverage":39}]}"#,
+        )
+        .unwrap();
+        std::fs::write(&empty, r#"{"domains":["example.com"]}"#).unwrap();
+        let with =
+            |path: &Path| Cli::parse_from(["c2pa-check", "--config", &path.to_string_lossy()]);
+
+        let got = sets(&with(&full)).unwrap();
+        let none = sets(&with(&empty));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].name.as_str(), got[0].coverage), ("shipped", None));
+        assert_eq!(
+            (got[1].name.as_str(), got[1].coverage),
+            ("sources", Some(39.0))
+        );
+        assert!(!got[1].git_tracked);
+        assert!(none.is_err());
+    }
+
+    #[test]
+    fn git_tracked_lists_committed_files_only() {
+        let listed = tracked().unwrap();
+
+        assert!(listed.contains("src/main.rs"));
+        assert!(!listed.contains("src/never-committed.rs"));
+    }
+
+    #[test]
+    fn a_set_is_judged_against_its_baseline_and_update_writes_it() {
+        let dir = std::env::temp_dir().join(format!("c2pa-check-base-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("empty.png");
+        std::fs::write(&file, b"not a picture").unwrap();
+        let (target, base) = (file.to_string_lossy().to_string(), dir.join("base.json"));
+        let run = |extra: &[&str]| {
+            let mut args = vec!["c2pa-check", "--offline", target.as_str(), "--baseline"];
+            let base = base.to_string_lossy().to_string();
+            args.push(&base);
+            args.extend(extra);
+            let cli = Cli::parse_from(args);
+            check(&cli, &sets(&cli).unwrap())
+        };
+
+        let missing = run(&[]);
+        let written = run(&["--update-baseline"]).unwrap();
+        let recorded = std::fs::read_to_string(&base).unwrap();
+        std::fs::write(
+            &base,
+            recorded
+                .replace("\"error\"", "\"valid_trusted\"")
+                .replace("\"absent\"", "\"valid_trusted\""),
+        )
+        .unwrap();
+        let compared = run(&[]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(missing.is_err());
+        assert!(written.failures.is_empty());
+        assert_eq!(compared.failures.len(), 1);
+        assert!(compared.failures[0].contains("credential lost since the baseline"));
+    }
+
+    pub fn results_named(named: &[(&str, CredentialStatus)]) -> Vec<(String, Option<Report>)> {
+        named
+            .iter()
+            .map(|(name, status)| (name.to_string(), Some(report(*status))))
+            .collect()
+    }
+
+    #[test]
+    fn a_missing_key_skips_the_step_instead_of_failing() {
+        assert!(skipped_without_key(None, "register"));
+        assert!(!skipped_without_key(Some("c2pa_test_x"), "register"));
+    }
+
+    #[test]
+    fn formats_pair_with_outputs_by_position() {
+        let (a, b) = (PathBuf::from("a.json"), PathBuf::from("b.xml"));
+        let outputs = [a.clone(), b.clone()];
+
+        let pairs = reports(&[Format::Json, Format::Junit], &outputs).unwrap();
+        let stdout = reports(&[Format::Ndjson], &[]).unwrap();
+        let default = reports(&[], &outputs[..1]).unwrap();
+
+        assert!(matches!(pairs[0], (Format::Json, Some(p)) if p == a));
+        assert!(matches!(pairs[1], (Format::Junit, Some(p)) if p == b));
+        assert!(matches!(stdout[0], (Format::Ndjson, None)));
+        assert!(matches!(default[0], (Format::Text, Some(_))));
+        assert!(reports(&[Format::Json], &outputs).is_err());
+    }
+
+    #[test]
+    fn a_failed_gate_says_which_number_missed() {
+        let set = results(&[CredentialStatus::ValidTrusted, CredentialStatus::Absent]);
+
+        let got = judge(&set, Some(Expect::Trusted), Some(80.0));
+
+        assert_eq!(
+            got,
+            [
+                "1 of 2 are not trusted",
+                "coverage 50.0% (1 of 2 trusted) is below 80"
+            ]
+        );
     }
 
     fn results(statuses: &[CredentialStatus]) -> Vec<(String, Option<Report>)> {

@@ -8,7 +8,23 @@ pub fn value(name: &str) -> Option<String> {
 }
 
 pub fn api_key() -> Option<String> {
-    first_set(value, &["C2PA_API_KEY", "C2PA_DESIGN_API_KEY"])
+    first_set(value, &["C2PA_API_KEY", "C2PA_DESIGN_API_KEY"]).or_else(|| {
+        let saved = std::fs::read_to_string(credentials_path()?).ok()?;
+        Some(saved.trim().to_string()).filter(|key| !key.is_empty())
+    })
+}
+
+pub fn config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })
+        .map(|base| base.join("c2pa-check"))
+}
+
+pub fn credentials_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("credentials"))
 }
 
 pub fn api_base() -> String {
