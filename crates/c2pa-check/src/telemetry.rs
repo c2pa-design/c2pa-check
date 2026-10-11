@@ -63,6 +63,13 @@ pub fn panic_hook() {
     }));
 }
 
+pub fn reportable(command: &str, exit_code: u8) -> bool {
+    !matches!(
+        exit_code,
+        0 | crate::EXIT_EXPECTATION | crate::carry_cmd::EXIT_REFUSED
+    ) && !matches!(command, "doctor" | "mcp" | SEND_COMMAND)
+}
+
 pub fn report(command: &str, exit_code: u8, offline: bool) {
     if cfg!(test) || !enabled(env::value, offline) {
         return;
@@ -72,7 +79,6 @@ pub fn report(command: &str, exit_code: u8, offline: bool) {
         2 => "usage_or_io",
         3 => "unreadable",
         4 => "network",
-        5 => "carry_refused",
         _ => "crash",
     };
     let mut body = json!({
@@ -139,6 +145,20 @@ mod tests {
         assert!(!enabled(with(&[("C2PA_TELEMETRY", "0")]), false));
         assert!(!enabled(with(&[("C2PA_TELEMETRY", "OFF")]), false));
         assert!(!enabled(with(&[("DO_NOT_TRACK", "1")]), false));
+    }
+
+    #[test]
+    fn a_refusal_and_a_failed_gate_are_answers_not_errors() {
+        assert!(!reportable("carry", 0));
+        assert!(!reportable("check", 1));
+        assert!(!reportable("carry", 5));
+        assert!(reportable("carry", 2));
+        assert!(reportable("check", 3));
+        assert!(reportable("register", 4));
+        assert!(reportable("carry", 101));
+        assert!(!reportable("doctor", 2));
+        assert!(!reportable("mcp", 2));
+        assert!(!reportable(SEND_COMMAND, 2));
     }
 
     #[test]

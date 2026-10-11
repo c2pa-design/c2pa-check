@@ -14,7 +14,7 @@ const GENERATOR_COMPOSE: &str = "c2pa-check compose";
 const COMPOSITE_SOURCE_TYPE: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/composite";
 const SIGNATURE_PREFIX: [u8; 2] = [0x58, 0x40];
 const PARENT_LABEL: &str = "parent";
-const RESERVE_MARGIN: usize = 16 * 1024;
+const RESERVE_MARGIN: usize = 1024;
 const RASTERS: [&str; 7] = ["jpeg", "png", "webp", "gif", "avif", "heic", "heif"];
 const ALLOWED_ACTIONS: [&str; 5] = [
     "c2pa.opened",
@@ -55,13 +55,18 @@ pub enum CarryError {
     Source(String),
 }
 
+pub const RULE_SOURCE_UNSIGNED: &str = "source_unsigned";
+pub const RULE_DIFFERENT_PICTURE: &str = "different_picture";
+pub const RULE_LOW_QUALITY: &str = "low_quality";
+pub const RULE_NOT_COMPARABLE: &str = "not_comparable";
+
 impl CarryError {
     pub fn rule(&self) -> Option<&'static str> {
         match self {
-            Self::NoSourceCredential => Some("source_unsigned"),
-            Self::DifferentPicture(_) => Some("different_picture"),
-            Self::LowQuality => Some("low_quality"),
-            Self::NotComparable => Some("not_comparable"),
+            Self::NoSourceCredential => Some(RULE_SOURCE_UNSIGNED),
+            Self::DifferentPicture(_) => Some(RULE_DIFFERENT_PICTURE),
+            Self::LowQuality => Some(RULE_LOW_QUALITY),
+            Self::NotComparable => Some(RULE_NOT_COMPARABLE),
             _ => None,
         }
     }
@@ -337,6 +342,53 @@ pub fn already_carried(
         })
 }
 
+pub fn require_credential(source: &[u8], source_mime: &str) -> Result<(), CarryError> {
+    let format = media::format_for(source_mime)
+        .ok_or_else(|| CarryError::UnsupportedMediaType(source_mime.to_string()))?;
+
+    source_state(source, format).map(|_| ())
+}
+
+pub fn made_from(signed: &[u8], signed_mime: &str, sources: &[(&[u8], &str)]) -> bool {
+    let Some(signed) = store(signed, signed_mime) else {
+        return false;
+    };
+    let ingredients = active_label(&signed)
+        .and_then(|active| signed.get("manifests")?.get(active)?.get("ingredients"))
+        .and_then(Value::as_array);
+    let Some(ingredients) = ingredients.filter(|items| items.len() == sources.len()) else {
+        return false;
+    };
+
+    sources.iter().all(|(bytes, mime)| {
+        let source = store(bytes, mime);
+        source.as_ref().and_then(active_label).is_none_or(|label| {
+            ingredients
+                .iter()
+                .any(|item| item.get("active_manifest").and_then(Value::as_str) == Some(label))
+        })
+    })
+}
+
+pub fn same_pixels(a: (&[u8], &str), b: (&[u8], &str), max_pixels: u64) -> bool {
+    let decode = |(bytes, mime): (&[u8], &str)| {
+        let format = media::format_for(mime)?;
+        if pdq::is_animation(bytes, format) {
+            return None;
+        }
+
+        pdq::still(bytes, format, max_pixels)
+    };
+    let (Some(a), Some(b)) = (decode(a), decode(b)) else {
+        return false;
+    };
+
+    a.width() == b.width()
+        && a.height() == b.height()
+        && a.color() == b.color()
+        && a.as_bytes() == b.as_bytes()
+}
+
 fn source_state(source: &[u8], format: &str) -> Result<bool, CarryError> {
     let context = read_context().map_err(|e| CarryError::Source(e.to_string()))?;
     match c2pa::Reader::from_context(context).with_stream(format, Cursor::new(source)) {
@@ -488,11 +540,37 @@ impl c2pa::Signer for DeferredSigner {
     }
 
     fn reserve_size(&self) -> usize {
-        self.chain
-            .iter()
-            .fold(PLACEHOLDER_LEN + RESERVE_MARGIN, |sum, der| {
-                sum.saturating_add(der.len())
-            })
+        reserve(&self.chain)
+    }
+}
+
+fn reserve(chain: &[Vec<u8>]) -> usize {
+    chain
+        .iter()
+        .fold(PLACEHOLDER_LEN + RESERVE_MARGIN, |sum, der| {
+            sum.saturating_add(der.len())
+        })
+}
+
+struct Untimestamped(Box<dyn c2pa::Signer + Send + Sync>);
+
+impl c2pa::Signer for Untimestamped {
+    fn sign(&self, data: &[u8]) -> c2pa::Result<Vec<u8>> {
+        self.0.sign(data)
+    }
+
+    fn alg(&self) -> c2pa::SigningAlg {
+        self.0.alg()
+    }
+
+    fn certs(&self) -> c2pa::Result<Vec<Vec<u8>>> {
+        self.0.certs()
+    }
+
+    fn reserve_size(&self) -> usize {
+        self.0
+            .certs()
+            .map_or_else(|_| self.0.reserve_size(), |chain| reserve(&chain))
     }
 }
 
@@ -566,13 +644,20 @@ pub fn local_signer(
     key_pem: &str,
     tsa_url: Option<String>,
 ) -> Result<Box<dyn c2pa::Signer + Send + Sync>, CarryError> {
-    c2pa::create_signer::from_keys(
+    let timestamped = tsa_url.is_some();
+    let signer = c2pa::create_signer::from_keys(
         chain_pem.as_bytes(),
         key_pem.as_bytes(),
         c2pa::SigningAlg::Es256,
         tsa_url,
     )
-    .map_err(|e| CarryError::Sign(e.to_string()))
+    .map_err(|e| CarryError::Sign(e.to_string()))?;
+
+    Ok(if timestamped {
+        signer
+    } else {
+        Box::new(Untimestamped(signer))
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -688,7 +773,7 @@ impl Verifier {
         match source_status {
             CredentialStatus::ValidTrusted | CredentialStatus::ValidUntrusted => {}
             CredentialStatus::Absent => {
-                return check.reject("source_unsigned", "the source has no Content Credential")
+                return check.reject(RULE_SOURCE_UNSIGNED, "the source has no Content Credential")
             }
             _ => return check.reject("source_invalid", source_codes),
         }
@@ -733,11 +818,11 @@ impl Verifier {
                 Comparison::Distance(d) => {
                     check.distance = Some(d);
                     if d > MATCH_DISTANCE {
-                        return check.reject("different_picture", format!("PDQ distance {d}"));
+                        return check.reject(RULE_DIFFERENT_PICTURE, format!("PDQ distance {d}"));
                     }
                 }
                 Comparison::LowQuality | Comparison::Unavailable => {
-                    return check.reject("low_quality", "the pictures cannot be compared")
+                    return check.reject(RULE_LOW_QUALITY, "the pictures cannot be compared")
                 }
             }
         }

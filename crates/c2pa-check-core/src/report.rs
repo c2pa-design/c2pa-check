@@ -146,6 +146,8 @@ pub struct ConformantProduct {
 pub struct Claim {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +163,18 @@ pub struct Source {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digital_source_type: Option<String>,
     pub category: SourceCategory,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherited: bool,
+}
+
+impl Source {
+    pub fn unknown() -> Self {
+        Self {
+            digital_source_type: None,
+            category: SourceCategory::Unknown,
+            inherited: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,10 +245,7 @@ impl Report {
             },
             signer: None,
             claim: None,
-            source: Source {
-                digital_source_type: None,
-                category: SourceCategory::Unknown,
-            },
+            source: Source::unknown(),
             actions: Vec::new(),
             ingredients: Vec::new(),
             validation: Validation::default(),

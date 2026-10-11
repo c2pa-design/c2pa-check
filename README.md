@@ -36,7 +36,7 @@ to the check command. JUnit marks every target that is not `valid_trusted` as a 
 | Exit | Meaning |
 |---|---|
 | `0` | pass |
-| `1` | expectation, coverage or baseline failed · `apply --wait` ended with a domain pending · `doctor` found a failing check · `carry --strict` found an unpaired file |
+| `1` | expectation, coverage or baseline failed · `apply --wait` ended with a domain pending · `doctor` found a failing check · `carry --strict` found an unpaired, ambiguous or unsigned original |
 | `2` | usage or I/O error |
 | `3` | unreadable asset (missing or unreadable local file, over 64 MiB, malformed manifest) |
 | `4` | a URL could not be fetched · `register` could not reach the API |
@@ -99,7 +99,8 @@ c2pa-check doctor --require api_key,webhook_secret
 
 Without `c2pa.json`, pass targets and flags as before.
 
-**Error reports.** When a command ends with an error (exit 2–5 or a crash) c2pa-check sends
+**Error reports.** When a command ends with an error (exit 2–4 or a crash; never for exit 1 or a
+carry refusal, exit 5) c2pa-check sends
 `{version, os, arch, command, exit_code, code, mime, ci}` to `POST /cli-reports` from a detached
 process (the command does not wait for it) and prints what it sends. No file names, paths, URLs, hashes or keys, and no API key. `C2PA_TELEMETRY=0`,
 `DO_NOT_TRACK=1` or `--offline` turn it off.
@@ -115,13 +116,13 @@ process (the command does not wait for it) and prints what it sends. No file nam
     output: c2pa-check.xml
 ```
 
-The action installs the release named by `version` (default `v0.3.0`) and checks it against the
+The action installs the release named by `version` (default `v0.4.0`) and checks it against the
 release's `SHA256SUMS` before running it. Every release publishes `SHA256SUMS` and a GitHub
 build-provenance attestation (`gh attestation verify c2pa-check-<target>.tar.gz -R
 c2pa-design/c2pa-check`); the npm packages are published with npm provenance
 (`npm audit signatures`).
 
-Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.3.0`
+Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.4.0`
 (`node:22-bookworm-slim` is the smallest that also has the glibc tools most pipelines expect;
 the binary itself is static musl, so `node:22-alpine` works too). Pin the version so `npx` hits
 its cache instead of resolving `latest` on every run, and cache `~/.npm` between jobs; or skip
@@ -143,6 +144,8 @@ npx -y c2pa-check carry 'public/**/*.{webp,avif}' --from-dir src/  # pairs by fi
 c2pa-check carry --from clip.mov --to clip.mp4 --force            # non-picture media
 c2pa-check keygen --out-dir .c2pa                                  # cert.pem + key.pem for CI
 c2pa-check carry --from hero.png --to hero.webp --json            # machine-readable result
+c2pa-check carry --from gen.png --to cut.png --edited             # carry, or an edit if the picture changed
+c2pa-check carry --from hero.png --to tmp.webp --out public/hero.webp   # a rerun keeps the signed file
 ```
 
 | Signer (first that is set) | Signed as | Verifies as |
@@ -156,6 +159,14 @@ credential is refused with exit `5`. With an API key, c2pa.design checks the car
 signs only an honest one; if hosted signing is unavailable, `carry` signs locally and warns.
 Never `COPY` or `ARG` a key into a Docker image: use `RUN --mount=type=secret`.
 
+| Case | Result |
+|---|---|
+| `--edited` and the output is not the same picture (`different_picture`, `low_quality`, `not_comparable`) | signed as an edit of the source: `parentOf`, `c2pa.opened` + `c2pa.edited`, status `composed`, exit `0` |
+| `--out` already holds a valid credential from the same sources and the same pixels as `--to` | `skipped`: the file is untouched, nothing is sent, no signature is spent |
+| `--out` was signed with the local key and a key or certificate is now set | signed again |
+| `--from-dir` and an original holds no credential | `unsigned`, passed over, exit `0` (`--strict`: exit `1`) |
+| Size | a credential adds about 6 KB plus the manifest store of each signed source (22 KB in a generator PNG we measured) |
+
 `carry --json` prints one object (an array for several files):
 
 ```json
@@ -163,7 +174,7 @@ Never `COPY` or `ARG` a key into a Docker image: use `RUN --mount=type=secret`.
  "source": "hero.png", "derived": "hero.webp"}
 ```
 
-`status` is `carried | composed | skipped | refused | error | unpaired | ambiguous`; `output`
+`status` is `carried | composed | skipped | refused | error | unpaired | ambiguous | unsigned`; `output`
 is the file written; `credential_status` is how the written file verifies. `rule` is set on a
 refusal: `different_picture`, `source_unsigned`, `low_quality`, `not_comparable`, or the rule
 c2pa.design returned with `carry_rejected` (`source_invalid`, `ingredient_mismatch`,

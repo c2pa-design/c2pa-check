@@ -18,6 +18,8 @@ pub const MIN_QUALITY: u8 = 50;
 pub const MATCH_DISTANCE: u32 = 31;
 const FRAME_INTERVAL_MS: u64 = 1000;
 const FRAME_DEDUPE_DISTANCE: u32 = 2;
+const FILE_TYPE_BOX: usize = 64;
+const SEQUENCE_BRANDS: [&[u8]; 4] = [b"avis", b"msf1", b"hevc", b"hevx"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pdq {
@@ -52,24 +54,47 @@ impl Variants {
 }
 
 pub fn fingerprint(bytes: &[u8], format: &str, max_pixels: u64) -> Fingerprint {
-    catch_unwind(AssertUnwindSafe(|| match format {
-        "gif" => animated(bytes, max_pixels),
-        "jpeg" => still(decode(bytes, ImageFormat::Jpeg, max_pixels)),
-        "png" => still(decode(bytes, ImageFormat::Png, max_pixels)),
-        "webp" => still(decode(bytes, ImageFormat::WebP, max_pixels)),
-        #[cfg(feature = "avif")]
-        "avif" => still(avif(bytes, max_pixels)),
-        #[cfg(feature = "heic")]
-        "heic" | "heif" => still(heic::decode(bytes, codec_cap(max_pixels))),
-        _ => Fingerprint::default(),
-    }))
-    .unwrap_or_default()
+    if format == "gif" {
+        return catch_unwind(AssertUnwindSafe(|| animated(bytes, max_pixels))).unwrap_or_default();
+    }
+
+    still(bytes, format, max_pixels).map_or_else(Fingerprint::default, |image| {
+        catch_unwind(AssertUnwindSafe(|| {
+            variants(image, true).into_fingerprint(Vec::new())
+        }))
+        .unwrap_or_default()
+    })
 }
 
-fn still(image: Option<DynamicImage>) -> Fingerprint {
-    image.map_or_else(Fingerprint::default, |image| {
-        variants(image, true).into_fingerprint(Vec::new())
-    })
+pub(crate) fn still(bytes: &[u8], format: &str, max_pixels: u64) -> Option<DynamicImage> {
+    catch_unwind(AssertUnwindSafe(|| match format {
+        "jpeg" => decode(bytes, ImageFormat::Jpeg, max_pixels),
+        "png" => decode(bytes, ImageFormat::Png, max_pixels),
+        "webp" => decode(bytes, ImageFormat::WebP, max_pixels),
+        #[cfg(feature = "avif")]
+        "avif" => avif(bytes, max_pixels),
+        #[cfg(feature = "heic")]
+        "heic" | "heif" => heic::decode(bytes, codec_cap(max_pixels)),
+        _ => None,
+    }))
+    .ok()
+    .flatten()
+}
+
+pub(crate) fn is_animation(bytes: &[u8], format: &str) -> bool {
+    catch_unwind(AssertUnwindSafe(|| match format {
+        "gif" => true,
+        "png" => image::codecs::png::PngDecoder::new(Cursor::new(bytes))
+            .and_then(|decoder| decoder.is_apng())
+            .unwrap_or(false),
+        "webp" => image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
+            .is_ok_and(|decoder| decoder.has_animation()),
+        "avif" | "heic" | "heif" => bytes
+            .get(..bytes.len().min(FILE_TYPE_BOX))
+            .is_some_and(|head| head.windows(4).any(|w| SEQUENCE_BRANDS.contains(&w))),
+        _ => false,
+    }))
+    .unwrap_or(true)
 }
 
 fn within(width: u32, height: u32, max_pixels: u64) -> bool {
@@ -496,6 +521,49 @@ mod tests {
             .write_to(&mut out, ImageFormat::Png)
             .expect("png encodes");
         out.into_inner()
+    }
+
+    fn chunk_crc(bytes: &[u8]) -> u32 {
+        !bytes.iter().fold(!0u32, |crc, byte| {
+            (0..8).fold(crc ^ u32::from(*byte), |crc, _| {
+                if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                }
+            })
+        })
+    }
+
+    fn with_animation_control(png: &[u8]) -> Vec<u8> {
+        const AFTER_HEADER: usize = 33;
+        let mut chunk = b"acTL".to_vec();
+        chunk.extend_from_slice(&2u32.to_be_bytes());
+        chunk.extend_from_slice(&0u32.to_be_bytes());
+        let mut out = png[..AFTER_HEADER].to_vec();
+        out.extend_from_slice(&8u32.to_be_bytes());
+        out.extend_from_slice(&chunk);
+        out.extend_from_slice(&chunk_crc(&chunk).to_be_bytes());
+        out.extend_from_slice(&png[AFTER_HEADER..]);
+        out
+    }
+
+    #[test]
+    fn an_animation_is_told_from_a_still_by_its_container() {
+        let still_png = png(&scene(64, 48));
+        let mut webp = Cursor::new(Vec::new());
+        scene(64, 48)
+            .write_to(&mut webp, ImageFormat::WebP)
+            .expect("webp encodes");
+
+        assert!(!is_animation(&still_png, "png"));
+        assert!(is_animation(&with_animation_control(&still_png), "png"));
+        assert!(!is_animation(webp.get_ref(), "webp"));
+        assert!(is_animation(b"GIF89a", "gif"));
+        assert!(is_animation(b"\0\0\0\x18ftypavis\0\0\0\0", "avif"));
+        assert!(!is_animation(b"\0\0\0\x18ftypheic\0\0\0\0mif1", "heic"));
+        assert!(!is_animation(b"not an image", "png"));
+        assert!(!is_animation(b"", "webp"));
     }
 
     fn jpeg(image: &DynamicImage, quality: u8) -> Vec<u8> {

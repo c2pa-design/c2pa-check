@@ -12,6 +12,11 @@ use crate::Options;
 
 const MAX_ACTIONS: usize = 64;
 const MAX_ENTRIES: usize = 64;
+const MAX_TITLE_CHARS: usize = 200;
+const MAX_SOURCE_DEPTH: usize = 8;
+const MAX_SOURCE_MANIFESTS: usize = 512;
+const RELATION_PARENT: &str = "parentOf";
+const RELATION_COMPONENT: &str = "componentOf";
 const MAX_DISTINCT_CODES: usize = 256;
 
 pub fn build(
@@ -35,7 +40,7 @@ pub fn build(
     };
     let signer = signer(active, trusted, selector);
     let claim = claim(active);
-    let (source, actions) = source_and_actions(active);
+    let (source, actions) = source_and_actions(&store, active);
     let ingredients = ingredients(active, options.max_ingredients);
     let validation = validation_entries(&store);
 
@@ -119,6 +124,8 @@ fn claim(active: Option<&Value>) -> Option<Claim> {
 
     Some(Claim {
         generator,
+        title: text(manifest.get("title"))
+            .map(|title| title.chars().take(MAX_TITLE_CHARS).collect()),
         spec_version: text(manifest.get("claim_version"))
             .or_else(|| text(manifest.get("spec_version"))),
         signed_at: signature.and_then(|info| text(info.get("time"))),
@@ -129,94 +136,171 @@ fn claim(active: Option<&Value>) -> Option<Claim> {
     })
 }
 
-fn source_and_actions(active: Option<&Value>) -> (Source, Vec<Action>) {
-    let mut category = SourceCategory::Unknown;
-    let mut declared: Option<String> = None;
-    let mut actions = Vec::new();
-
+fn source_and_actions(store: &Value, active: Option<&Value>) -> (Source, Vec<Action>) {
     let Some(manifest) = active else {
-        return (
-            Source {
-                digital_source_type: None,
-                category,
-            },
-            actions,
-        );
+        return (Source::unknown(), Vec::new());
     };
+    let mut budget = MAX_SOURCE_MANIFESTS;
 
-    for assertion in manifest
+    (
+        resolved_source(store, manifest, MAX_SOURCE_DEPTH, &mut budget),
+        actions(manifest),
+    )
+}
+
+fn assertions(manifest: &Value) -> impl Iterator<Item = (&str, Option<&Value>)> {
+    manifest
         .get("assertions")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
-    {
-        let label = assertion.get("label").and_then(Value::as_str).unwrap_or("");
-        let data = assertion.get("data");
+        .iter()
+        .map(|assertion| {
+            (
+                assertion.get("label").and_then(Value::as_str).unwrap_or(""),
+                assertion.get("data"),
+            )
+        })
+}
 
-        if label.starts_with("c2pa.actions") {
-            for entry in data
-                .and_then(|d| d.get("actions"))
+fn action_entries(manifest: &Value) -> impl Iterator<Item = &Value> {
+    assertions(manifest)
+        .filter(|(label, _)| label.starts_with("c2pa.actions"))
+        .flat_map(|(_, data)| {
+            data.and_then(|d| d.get("actions"))
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or_default()
-            {
-                if let Some(uri) = entry.get("digitalSourceType").and_then(Value::as_str) {
-                    if let Some(found) = classify::category_of(uri) {
-                        category = classify::strongest(category, found);
-                        declared = Some(uri.to_string());
-                    }
-                }
-                if let Some(name) = entry.get("action").and_then(Value::as_str) {
-                    if actions.len() < MAX_ACTIONS {
-                        actions.push(Action {
-                            action: name.to_string(),
-                            when: text(entry.get("when")),
-                            software: text(entry.get("softwareAgent")).or_else(|| {
-                                entry
-                                    .get("softwareAgent")
-                                    .and_then(|agent| text(agent.get("name")))
-                            }),
-                        });
-                    }
-                }
-            }
-        }
+        })
+}
 
-        if label.starts_with("stds.iptc") {
-            let uri = data
-                .and_then(|d| {
-                    d.get("digitalSourceType")
-                        .or_else(|| d.get("Iptc4xmpExt:DigitalSourceType"))
-                })
-                .and_then(Value::as_str);
-            if let Some(found) = uri.and_then(classify::category_of) {
-                category = classify::strongest(category, found);
-                declared = uri.map(str::to_string);
-            }
-        }
-    }
+fn actions(manifest: &Value) -> Vec<Action> {
+    action_entries(manifest)
+        .filter_map(|entry| {
+            let name = entry.get("action").and_then(Value::as_str)?;
 
-    if category == SourceCategory::Unknown {
-        let generator = manifest
-            .get("claim_generator_info")
-            .and_then(Value::as_array)
-            .and_then(|list| list.first())
-            .and_then(|first| first.get("name"))
+            Some(Action {
+                action: name.to_string(),
+                when: text(entry.get("when")),
+                software: text(entry.get("softwareAgent")).or_else(|| {
+                    entry
+                        .get("softwareAgent")
+                        .and_then(|agent| text(agent.get("name")))
+                }),
+            })
+        })
+        .take(MAX_ACTIONS)
+        .collect()
+}
+
+fn declared_source(manifest: &Value) -> Source {
+    let from_actions = action_entries(manifest)
+        .filter_map(|entry| entry.get("digitalSourceType").and_then(Value::as_str));
+    let from_iptc = assertions(manifest)
+        .filter(|(label, _)| label.starts_with("stds.iptc"))
+        .filter_map(|(_, data)| {
+            data.and_then(|d| {
+                d.get("digitalSourceType")
+                    .or_else(|| d.get("Iptc4xmpExt:DigitalSourceType"))
+            })
             .and_then(Value::as_str)
-            .or_else(|| manifest.get("claim_generator").and_then(Value::as_str))
-            .unwrap_or("");
-        if let Some(found) = classify::from_generator(generator) {
-            category = found;
+        });
+
+    from_actions
+        .chain(from_iptc)
+        .fold(Source::unknown(), |mut source, uri| {
+            if let Some(found) = classify::category_of(uri) {
+                source.category = classify::strongest(source.category, found);
+                source.digital_source_type = Some(uri.to_string());
+            }
+            source
+        })
+}
+
+fn generator_source(manifest: &Value) -> Option<SourceCategory> {
+    let generator = manifest
+        .get("claim_generator_info")
+        .and_then(Value::as_array)
+        .and_then(|list| list.first())
+        .and_then(|first| first.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .or_else(|| manifest.get("claim_generator").and_then(Value::as_str))
+        .unwrap_or("");
+
+    classify::from_generator(generator)
+}
+
+fn strongest_ingredient(
+    store: &Value,
+    manifest: &Value,
+    relationship: &str,
+    depth: usize,
+    budget: &mut usize,
+) -> Source {
+    let mut strongest = Source::unknown();
+    if depth == 0 {
+        return strongest;
+    }
+
+    for item in manifest
+        .get("ingredients")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        if *budget == 0 {
+            break;
+        }
+        let related = item.get("relationship").and_then(Value::as_str) == Some(relationship);
+        let valid = ingredient_status(item) == Some(CredentialStatus::ValidUntrusted);
+        let origin = item
+            .get("active_manifest")
+            .and_then(Value::as_str)
+            .and_then(|label| store.get("manifests")?.get(label));
+        let Some(origin) = origin.filter(|_| related && valid) else {
+            continue;
+        };
+        *budget -= 1;
+
+        let found = resolved_source(store, origin, depth - 1, budget);
+        if classify::strongest(strongest.category, found.category) != strongest.category {
+            strongest = found;
         }
     }
 
-    (
-        Source {
-            digital_source_type: declared,
-            category,
-        },
-        actions,
-    )
+    strongest
+}
+
+fn resolved_source(store: &Value, manifest: &Value, depth: usize, budget: &mut usize) -> Source {
+    let own = declared_source(manifest);
+    let parent = strongest_ingredient(store, manifest, RELATION_PARENT, depth, budget);
+    let component = strongest_ingredient(store, manifest, RELATION_COMPONENT, depth, budget);
+
+    let composite = own.category == SourceCategory::Unknown
+        || own
+            .digital_source_type
+            .as_deref()
+            .is_some_and(classify::is_plain_composite);
+    let mut source =
+        if own.category == SourceCategory::Unknown && parent.category != SourceCategory::Unknown {
+            Source {
+                inherited: true,
+                ..parent
+            }
+        } else {
+            own
+        };
+    if composite && classify::is_ai(component.category) {
+        let raised = classify::strongest(source.category, SourceCategory::AiComposite);
+        source.inherited = source.inherited || raised != source.category;
+        source.category = raised;
+    }
+    if source.category == SourceCategory::Unknown {
+        source.category = generator_source(manifest).unwrap_or(SourceCategory::Unknown);
+    }
+
+    source
 }
 
 fn ingredients(active: Option<&Value>, limit: usize) -> Vec<Ingredient> {
@@ -405,6 +489,199 @@ mod tests {
         assert_eq!(report.credential.status, CredentialStatus::PresentInvalid);
         assert!(report.credential.present);
         assert!(!report.credential.valid);
+    }
+
+    const AI_GENERATED: &str =
+        "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia";
+    const CAPTURED: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture";
+    const COMPOSITE: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/composite";
+
+    fn manifest(declared: Option<&str>, ingredients: Value) -> Value {
+        let mut action = serde_json::json!({"action": "c2pa.opened"});
+        if let Some(uri) = declared {
+            action["digitalSourceType"] = Value::from(uri);
+        }
+
+        serde_json::json!({
+            "claim_generator_info": [{"name": "c2pa-check carry", "version": "1"}],
+            "assertions": [{"label": "c2pa.actions.v2", "data": {"actions": [action]}}],
+            "ingredients": ingredients
+        })
+    }
+
+    fn ingredient(relationship: &str, label: &str) -> Value {
+        serde_json::json!({"relationship": relationship, "active_manifest": label})
+    }
+
+    fn source_of(manifests: Value) -> Source {
+        let store = serde_json::json!({
+            "active_manifest": "urn:active",
+            "validation_state": "Valid",
+            "manifests": manifests
+        });
+
+        build(
+            store,
+            engine(),
+            asset(),
+            &Options::default(),
+            TrustSelector::Official,
+        )
+        .source
+    }
+
+    #[test]
+    fn a_carried_file_inherits_the_declared_source_of_its_parent() {
+        let source = source_of(serde_json::json!({
+            "urn:active": manifest(None, serde_json::json!([ingredient("parentOf", "urn:parent")])),
+            "urn:parent": manifest(Some(AI_GENERATED), serde_json::json!([]))
+        }));
+
+        assert_eq!(source.category, SourceCategory::AiGenerated);
+        assert_eq!(source.digital_source_type.as_deref(), Some(AI_GENERATED));
+        assert!(source.inherited);
+    }
+
+    #[test]
+    fn a_source_the_file_declares_itself_wins_over_its_parent() {
+        let source = source_of(serde_json::json!({
+            "urn:active": manifest(Some(CAPTURED), serde_json::json!([ingredient("parentOf", "urn:parent")])),
+            "urn:parent": manifest(Some(AI_GENERATED), serde_json::json!([]))
+        }));
+
+        assert_eq!(source.category, SourceCategory::Camera);
+        assert_eq!(source.digital_source_type.as_deref(), Some(CAPTURED));
+        assert!(!source.inherited);
+    }
+
+    #[test]
+    fn a_parent_whose_credential_does_not_validate_or_is_missing_is_not_followed() {
+        let mut invalid = ingredient("parentOf", "urn:parent");
+        invalid["validation_status"] = serde_json::json!([{"code": "assertion.dataHash.mismatch"}]);
+        let parent = manifest(Some(AI_GENERATED), serde_json::json!([]));
+
+        let failed = source_of(serde_json::json!({
+            "urn:active": manifest(None, serde_json::json!([invalid])),
+            "urn:parent": parent
+        }));
+        let missing = source_of(serde_json::json!({
+            "urn:active": manifest(None, serde_json::json!([ingredient("parentOf", "urn:gone")]))
+        }));
+        let unsigned = source_of(serde_json::json!({
+            "urn:active": manifest(None, serde_json::json!([{"relationship": "parentOf", "title": "a.png"}]))
+        }));
+
+        for source in [failed, missing, unsigned] {
+            assert_eq!(source.category, SourceCategory::Unknown);
+            assert_eq!(source.digital_source_type, None);
+            assert!(!source.inherited);
+        }
+    }
+
+    fn chain(length: usize) -> Value {
+        let mut manifests = serde_json::Map::new();
+        for index in 0..length {
+            let label = if index == 0 {
+                "urn:active".to_string()
+            } else {
+                format!("urn:{index}")
+            };
+            let next = serde_json::json!([ingredient("parentOf", &format!("urn:{}", index + 1))]);
+            manifests.insert(label, manifest(None, next));
+        }
+        manifests.insert(
+            format!("urn:{length}"),
+            manifest(Some(AI_GENERATED), serde_json::json!([])),
+        );
+
+        Value::Object(manifests)
+    }
+
+    #[test]
+    fn the_parent_chain_is_followed_to_a_fixed_depth_and_a_cycle_ends() {
+        let near = source_of(chain(MAX_SOURCE_DEPTH));
+        let far = source_of(chain(MAX_SOURCE_DEPTH + 1));
+        let cycle = source_of(serde_json::json!({
+            "urn:active": manifest(None, serde_json::json!([ingredient("parentOf", "urn:active")]))
+        }));
+
+        assert_eq!(near.category, SourceCategory::AiGenerated);
+        assert!(near.inherited);
+        assert_eq!(far.category, SourceCategory::Unknown);
+        assert!(!far.inherited);
+        assert_eq!(cycle.category, SourceCategory::Unknown);
+    }
+
+    #[test]
+    fn a_parent_known_only_by_its_generator_name_is_inherited_too() {
+        let mut parent = manifest(None, serde_json::json!([]));
+        parent["claim_generator_info"] = serde_json::json!([{"name": "OpenAI Media Service API"}]);
+
+        let source = source_of(serde_json::json!({
+            "urn:active": manifest(None, serde_json::json!([ingredient("parentOf", "urn:parent")])),
+            "urn:parent": parent
+        }));
+
+        assert_eq!(source.category, SourceCategory::AiGenerated);
+        assert_eq!(source.digital_source_type, None);
+        assert!(source.inherited);
+    }
+
+    #[test]
+    fn a_composite_with_an_ai_component_is_an_ai_composite() {
+        let direct = source_of(serde_json::json!({
+            "urn:active": manifest(Some(COMPOSITE), serde_json::json!([
+                ingredient("componentOf", "urn:photo"),
+                ingredient("componentOf", "urn:generated")
+            ])),
+            "urn:photo": manifest(Some(CAPTURED), serde_json::json!([])),
+            "urn:generated": manifest(Some(AI_GENERATED), serde_json::json!([]))
+        }));
+        let behind_a_carry = source_of(serde_json::json!({
+            "urn:active": manifest(Some(COMPOSITE), serde_json::json!([ingredient("componentOf", "urn:carried")])),
+            "urn:carried": manifest(None, serde_json::json!([ingredient("parentOf", "urn:generated")])),
+            "urn:generated": manifest(Some(AI_GENERATED), serde_json::json!([]))
+        }));
+        let undeclared = source_of(serde_json::json!({
+            "urn:active": manifest(None, serde_json::json!([ingredient("componentOf", "urn:generated")])),
+            "urn:generated": manifest(Some(AI_GENERATED), serde_json::json!([]))
+        }));
+
+        for source in [&direct, &behind_a_carry] {
+            assert_eq!(source.category, SourceCategory::AiComposite);
+            assert_eq!(source.digital_source_type.as_deref(), Some(COMPOSITE));
+            assert!(source.inherited);
+        }
+        assert_eq!(undeclared.category, SourceCategory::AiComposite);
+        assert_eq!(undeclared.digital_source_type, None);
+        assert!(undeclared.inherited);
+    }
+
+    #[test]
+    fn a_composite_without_a_valid_ai_component_keeps_what_it_declares() {
+        let mut invalid = ingredient("componentOf", "urn:generated");
+        invalid["validation_status"] = serde_json::json!([{"code": "claimSignature.mismatch"}]);
+        let generated = manifest(Some(AI_GENERATED), serde_json::json!([]));
+
+        let of_photos = source_of(serde_json::json!({
+            "urn:active": manifest(Some(COMPOSITE), serde_json::json!([ingredient("componentOf", "urn:photo")])),
+            "urn:photo": manifest(Some(CAPTURED), serde_json::json!([]))
+        }));
+        let of_an_invalid_component = source_of(serde_json::json!({
+            "urn:active": manifest(Some(COMPOSITE), serde_json::json!([invalid])),
+            "urn:generated": generated.clone()
+        }));
+        let declared_stronger = source_of(serde_json::json!({
+            "urn:active": manifest(Some(AI_GENERATED), serde_json::json!([ingredient("componentOf", "urn:generated")])),
+            "urn:generated": generated
+        }));
+
+        for source in [of_photos, of_an_invalid_component] {
+            assert_eq!(source.category, SourceCategory::Software);
+            assert!(!source.inherited);
+        }
+        assert_eq!(declared_stronger.category, SourceCategory::AiGenerated);
+        assert!(!declared_stronger.inherited);
     }
 
     #[test]

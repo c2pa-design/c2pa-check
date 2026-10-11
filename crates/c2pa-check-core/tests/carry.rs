@@ -685,3 +685,159 @@ fn a_derived_file_of_an_unsupported_type_is_derived_unreadable() {
     assert_eq!(result.rule, "derived_unreadable");
     assert!(result.source.report.is_none());
 }
+
+#[test]
+fn a_three_certificate_chain_fits_the_reserved_signature_box() {
+    let (source, image) = generated();
+    let derived = encode(&image, ImageFormat::WebP);
+    let identity = generate_identity("acme.example via c2pa.design").expect("identity");
+    let extra = generate_identity("cross-signed").expect("identity");
+    let mut chain = pem_chain_to_der(&identity.chain_pem).expect("chain");
+    chain.extend(pem_chain_to_der(&extra.chain_pem).expect("chain").pop());
+    let placeholder = new_placeholder().expect("placeholder");
+    let signer = DeferredSigner::new(chain.clone(), placeholder);
+
+    let outcome = carry::carry(
+        &source,
+        "image/png",
+        &derived,
+        "image/webp",
+        &signer,
+        &options(),
+    )
+    .expect("the signature box holds the chain");
+    let signature = local_signer(&identity.chain_pem, &identity.key_pem, None)
+        .expect("org signer")
+        .sign(&signer.take_tbs().expect("tbs captured"))
+        .expect("signature");
+    let signed =
+        carry::patch_placeholder(&outcome.bytes, &placeholder, &signature).expect("patched");
+    let report = verifier()
+        .verify(&signed, "image/webp", &Options::default())
+        .expect("a report");
+
+    assert_eq!(chain.len(), 3);
+    assert_eq!(report.credential.status, CredentialStatus::ValidUntrusted);
+}
+
+#[test]
+fn a_file_without_a_credential_or_of_an_unknown_type_has_nothing_to_require() {
+    let (source, image) = generated();
+
+    assert!(carry::require_credential(&source, "image/png").is_ok());
+    assert!(matches!(
+        carry::require_credential(&encode(&image, ImageFormat::Png), "image/png"),
+        Err(CarryError::NoSourceCredential)
+    ));
+    assert!(matches!(
+        carry::require_credential(&source, "image/bmp"),
+        Err(CarryError::UnsupportedMediaType(_))
+    ));
+    assert!(matches!(
+        carry::require_credential(b"not a png", "image/png"),
+        Err(CarryError::NoSourceCredential | CarryError::Source(_))
+    ));
+}
+
+#[test]
+fn a_signed_file_is_made_from_exactly_its_sources() {
+    let (source, image) = generated();
+    let (other, _) = generated();
+    let plain = encode(&image, ImageFormat::Png);
+    let derived = encode(&image, ImageFormat::WebP);
+    let identity = generate_identity("Carry Test").expect("identity");
+    let signer = local_signer(&identity.chain_pem, &identity.key_pem, None).expect("signer");
+    let carried = carry::carry(
+        &source,
+        "image/png",
+        &derived,
+        "image/webp",
+        signer.as_ref(),
+        &options(),
+    )
+    .expect("carried")
+    .bytes;
+    let made_from = |sources: &[(&[u8], &str)]| carry::made_from(&carried, "image/webp", sources);
+
+    assert!(made_from(&[(&source, "image/png")]));
+    assert!(!made_from(&[(&other, "image/png")]));
+    assert!(!made_from(&[(&source, "image/png"), (&plain, "image/png")]));
+    assert!(!made_from(&[]));
+    assert!(!carry::made_from(
+        &derived,
+        "image/webp",
+        &[(&source, "image/png")]
+    ));
+    assert!(!carry::made_from(
+        b"corrupt",
+        "image/webp",
+        &[(&source, "image/png")]
+    ));
+}
+
+#[test]
+fn pixels_are_the_same_only_when_both_files_decode_to_the_same_picture() {
+    let image = scene(320, 240, 0.0);
+    let webp = encode(&image, ImageFormat::WebP);
+    let identity = generate_identity("Carry Test").expect("identity");
+    let signed = sign_generated(encode(&image, ImageFormat::Png), &identity);
+    let same = |a: (&[u8], &str), b: (&[u8], &str)| carry::same_pixels(a, b, 100_000_000);
+
+    assert!(same((&webp, "image/webp"), (&webp, "image/webp")));
+    assert!(same(
+        (&signed, "image/png"),
+        (&encode(&image, ImageFormat::Png), "image/png")
+    ));
+    assert!(!same(
+        (&webp, "image/webp"),
+        (&encode(&image.brighten(1), ImageFormat::WebP), "image/webp")
+    ));
+    assert!(!same(
+        (&webp, "image/webp"),
+        (
+            &encode(&image.crop_imm(0, 0, 319, 240), ImageFormat::WebP),
+            "image/webp"
+        )
+    ));
+    assert!(!same((&webp, "image/webp"), (b"corrupt", "image/webp")));
+    assert!(!same(
+        (&webp[..webp.len() / 2], "image/webp"),
+        (&webp, "image/webp")
+    ));
+    assert!(!same((&webp, "image/bmp"), (&webp, "image/bmp")));
+    assert!(!carry::same_pixels(
+        (&webp, "image/webp"),
+        (&webp, "image/webp"),
+        1000
+    ));
+}
+
+#[test]
+fn a_carried_file_reports_the_source_category_of_its_original() {
+    let (source, image) = generated();
+    let identity = generate_identity("Carry Test").expect("identity");
+    let signer = local_signer(&identity.chain_pem, &identity.key_pem, None).expect("signer");
+    let carried = carry::carry(
+        &source,
+        "image/png",
+        &encode(&image, ImageFormat::WebP),
+        "image/webp",
+        signer.as_ref(),
+        &options(),
+    )
+    .expect("carried");
+
+    let report = verifier()
+        .verify(&carried.bytes, "image/webp", &Options::default())
+        .expect("a report");
+
+    assert_eq!(
+        report.source.category,
+        c2pa_check_core::report::SourceCategory::AiGenerated
+    );
+    assert_eq!(
+        report.source.digital_source_type.as_deref(),
+        Some(AI_SOURCE)
+    );
+    assert!(report.source.inherited);
+}

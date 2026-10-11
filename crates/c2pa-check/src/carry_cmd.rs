@@ -35,6 +35,13 @@ const FALLBACK_CODES: [&str; 7] = [
     "timeout",
 ];
 const LOCAL_NAME: &str = "c2pa-check local identity";
+const MODE_LOCAL: &str = "local";
+const COMPONENT_TITLE: &str = "component";
+const EDIT_RULES: [&str; 3] = [
+    carry::RULE_DIFFERENT_PICTURE,
+    carry::RULE_LOW_QUALITY,
+    carry::RULE_NOT_COMPARABLE,
+];
 const BOUNDARY_BYTES: usize = 12;
 const SIGNER_HINT: &str = "set C2PA_API_KEY to sign as your organization, or C2PA_SIGN_CERT and C2PA_SIGN_KEY to sign with your own certificate";
 
@@ -80,15 +87,14 @@ pub struct CarryArgs {
     compose: Vec<PathBuf>,
     #[arg(
         long,
-        requires = "compose",
-        help = "with --compose: record c2pa.edited instead of c2pa.created"
+        help = "sign as an edit of the source: with --from when the output is not the same picture, with --compose instead of c2pa.created"
     )]
     edited: bool,
     #[arg(long, help = "print one JSON document")]
     json: bool,
     #[arg(
         long,
-        help = "exit 1 when a derived file has no or an ambiguous original"
+        help = "exit 1 when a derived file has no original, an ambiguous one, or one without a Content Credential"
     )]
     strict: bool,
 }
@@ -138,6 +144,8 @@ struct Item {
     carry_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    #[serde(skip)]
+    signer_warnings: Vec<String>,
 }
 
 struct Run<'a> {
@@ -145,7 +153,9 @@ struct Run<'a> {
     mode: Mode,
     tsa: Option<String>,
     force: bool,
+    edited: bool,
     local: Mutex<Option<LocalIdentity>>,
+    identity_note: Mutex<Option<String>>,
     chain: Mutex<Option<Certificate>>,
     warnings: Vec<String>,
 }
@@ -157,7 +167,9 @@ pub fn run(args: CarryArgs, verifier: &Verifier) -> anyhow::Result<u8> {
         mode,
         tsa: env::value("C2PA_TSA_URL"),
         force: args.force,
+        edited: args.edited,
         local: Mutex::new(None),
+        identity_note: Mutex::new(None),
         chain: Mutex::new(None),
         warnings,
     };
@@ -165,7 +177,7 @@ pub fn run(args: CarryArgs, verifier: &Verifier) -> anyhow::Result<u8> {
     let items = match (&args.from, &args.to, &args.from_dir) {
         (None, Some(to), None) if !args.compose.is_empty() => {
             let out = args.out.clone().unwrap_or_else(|| to.clone());
-            vec![compose_one(&context, &args.compose, to, &out, args.edited)]
+            vec![compose_one(&context, &args.compose, to, &out)]
         }
         (None, None, None) if !args.compose.is_empty() => {
             anyhow::bail!("--compose needs --to OUTPUT, the rendered composite to sign")
@@ -200,7 +212,7 @@ fn exit_code(items: &[Item], strict: bool) -> u8 {
     if strict
         && items
             .iter()
-            .any(|i| matches!(i.status, "unpaired" | "ambiguous"))
+            .any(|i| matches!(i.status, "unpaired" | "ambiguous" | "unsigned"))
     {
         return EXIT_UNPAIRED;
     }
@@ -245,9 +257,11 @@ fn report(items: &[Item], json: bool) -> anyhow::Result<()> {
                 item.signer.as_deref().unwrap_or("unknown"),
             ),
             "skipped" => println!(
-                "skipped  {} (already carries {})",
-                item.derived,
-                item.source.as_deref().unwrap_or_default()
+                "skipped  {} (already signed from {})",
+                item.out.as_deref().unwrap_or(&item.derived),
+                item.source
+                    .clone()
+                    .unwrap_or_else(|| item.sources.join(", "))
             ),
             other => eprintln!(
                 "{other:<8} {}: {}",
@@ -287,7 +301,7 @@ fn batch(context: &Run<'_>, dir: &Path, patterns: &[String]) -> anyhow::Result<V
                     break;
                 };
                 let item = match pairing {
-                    Ok(source) => carry_one(context, source, derived, derived),
+                    Ok(source) => unsigned_in_folder(carry_one(context, source, derived, derived)),
                     Err(status) => Item {
                         derived: derived.display().to_string(),
                         status,
@@ -310,6 +324,15 @@ fn batch(context: &Run<'_>, dir: &Path, patterns: &[String]) -> anyhow::Result<V
         .into_iter()
         .filter_map(|slot| slot.into_inner().ok().flatten())
         .collect())
+}
+
+fn unsigned_in_folder(mut item: Item) -> Item {
+    if item.status == "refused" && item.rule.as_deref() == Some(carry::RULE_SOURCE_UNSIGNED) {
+        item.status = "unsigned";
+        item.rule = None;
+        item.message = Some("the original holds no Content Credential; nothing to carry".into());
+    }
+    item
 }
 
 fn original_for(
@@ -369,7 +392,7 @@ fn carry_one(context: &Run<'_>, source_path: &Path, derived_path: &Path, out_pat
         ..Item::default()
     };
     let result = carry_inner(context, source_path, derived_path, out_path, &mut item);
-    settle(item, result)
+    settle(context, item, result)
 }
 
 fn compose_one(
@@ -377,7 +400,6 @@ fn compose_one(
     sources: &[PathBuf],
     output_path: &Path,
     out_path: &Path,
-    edited: bool,
 ) -> Item {
     let mut item = Item {
         derived: output_path.display().to_string(),
@@ -385,11 +407,11 @@ fn compose_one(
         warnings: context.warnings.clone(),
         ..Item::default()
     };
-    let result = compose_inner(context, sources, output_path, out_path, edited, &mut item);
-    settle(item, result)
+    let result = compose_inner(context, sources, output_path, out_path, &mut item);
+    settle(context, item, result)
 }
 
-fn settle(mut item: Item, result: Result<(), Failure>) -> Item {
+fn settle(context: &Run<'_>, mut item: Item, result: Result<(), Failure>) -> Item {
     match result {
         Ok(()) => {}
         Err(Failure::Refused(rule, message)) => {
@@ -401,6 +423,15 @@ fn settle(mut item: Item, result: Result<(), Failure>) -> Item {
             item.status = "error";
             item.message = Some(format!("{err:#}"));
         }
+    }
+    if matches!(item.status, "carried" | "composed") {
+        if item.signer_mode == Some(MODE_LOCAL) {
+            if let Ok(mut note) = context.identity_note.lock() {
+                item.signer_warnings.extend(note.take());
+            }
+        }
+        item.signer_warnings.dedup();
+        item.warnings.append(&mut item.signer_warnings);
     }
     item
 }
@@ -426,12 +457,62 @@ fn file_title(path: &Path) -> Option<String> {
     path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
+struct Output<'a> {
+    unsigned: &'a [u8],
+    mime: &'a str,
+    to: &'a Path,
+    out: &'a Path,
+}
+
+fn output_is_current(
+    context: &Run<'_>,
+    output: &Output<'_>,
+    sources: &[(&[u8], &str)],
+    item: &mut Item,
+) -> bool {
+    if same_file(output.out, output.to) {
+        return false;
+    }
+    let Ok(signed) = read_media(output.out) else {
+        return false;
+    };
+    let mime = mime_from_extension(&output.out.to_string_lossy());
+    if !carry::made_from(&signed, mime, sources) {
+        return false;
+    }
+    let Ok(report) = context.verifier.verify(&signed, mime, &Options::default()) else {
+        return false;
+    };
+    let valid = matches!(
+        report.credential.status,
+        CredentialStatus::ValidTrusted | CredentialStatus::ValidUntrusted
+    );
+    let local = report
+        .signer
+        .and_then(|s| s.common_name.or(s.organization))
+        .is_some_and(|name| name == LOCAL_NAME);
+    let upgrade = local && !matches!(context.mode, Mode::Local);
+
+    let current = valid
+        && !upgrade
+        && carry::same_pixels(
+            (&signed, mime),
+            (output.unsigned, output.mime),
+            Options::default().max_pixels,
+        );
+    if current {
+        item.status = "skipped";
+        item.out = Some(output.out.display().to_string());
+    }
+
+    current
+}
+
 fn compose_inner(
     context: &Run<'_>,
     sources: &[PathBuf],
     output_path: &Path,
     out_path: &Path,
-    edited: bool,
     item: &mut Item,
 ) -> Result<(), Failure> {
     if sources.len() > MAX_COMPOSE_SOURCES {
@@ -446,30 +527,48 @@ fn compose_inner(
             Ok((
                 read_media(path)?,
                 mime_from_extension(&path.to_string_lossy()),
-                file_title(path).unwrap_or_else(|| "component".into()),
+                file_title(path).unwrap_or_else(|| COMPONENT_TITLE.into()),
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let output = read_media(output_path)?;
-    let output_mime = mime_from_extension(&output_path.to_string_lossy());
+    let unsigned = read_media(output_path)?;
+    let output = Output {
+        unsigned: &unsigned,
+        mime: mime_from_extension(&output_path.to_string_lossy()),
+        to: output_path,
+        out: out_path,
+    };
     let components: Vec<carry::Component<'_>> = read
         .iter()
         .map(|(bytes, mime, title)| carry::Component { bytes, mime, title })
         .collect();
+    let media: Vec<(&[u8], &str)> = components.iter().map(|c| (c.bytes, c.mime)).collect();
+    if output_is_current(context, &output, &media, item) {
+        return Ok(());
+    }
 
-    let title = file_title(output_path);
+    compose_signed(context, &components, &output, item)
+}
+
+fn compose_signed(
+    context: &Run<'_>,
+    components: &[carry::Component<'_>],
+    output: &Output<'_>,
+    item: &mut Item,
+) -> Result<(), Failure> {
+    let title = file_title(output.to);
     let work = Composite {
-        components: &components,
-        output: &output,
-        output_mime,
-        edited,
+        components,
+        output: output.unsigned,
+        output_mime: output.mime,
+        edited: context.edited,
         title: title.as_deref(),
     };
     let hosted = match &context.mode {
         Mode::Hosted { base, key } => match hosted_compose(context, base, key, &work, item) {
             Ok(done) => Some(done),
             Err(Hosted::Fallback(reason)) => {
-                item.warnings.push(format!(
+                item.signer_warnings.push(format!(
                     "hosted signing unavailable ({reason}); signed with a local key. {SIGNER_HINT}"
                 ));
                 None
@@ -481,7 +580,7 @@ fn compose_inner(
     let (outcome, mode) = match hosted {
         Some(outcome) => (outcome, "hosted"),
         None => {
-            let (signer, mode) = local_signer(context, item)?;
+            let (signer, mode) = local_signer(context)?;
             (work.compose(signer.as_ref())?, mode)
         }
     };
@@ -493,7 +592,7 @@ fn compose_inner(
         ));
     }
 
-    verify_and_write(context, &outcome.bytes, output_mime, out_path, item)?;
+    verify_and_write(context, &outcome.bytes, output.mime, output.out, item)?;
     item.status = "composed";
     item.signer_mode = Some(mode);
     item.actions = outcome.actions;
@@ -600,6 +699,8 @@ fn carry_inner(
         derived_mime: mime_from_extension(&derived_path.to_string_lossy()),
     };
 
+    carry::require_credential(pair.source, pair.source_mime)?;
+
     if carry::already_carried(
         pair.source,
         pair.source_mime,
@@ -609,6 +710,15 @@ fn carry_inner(
         item.status = "skipped";
         return Ok(());
     }
+    let output = Output {
+        unsigned: pair.derived,
+        mime: pair.derived_mime,
+        to: derived_path,
+        out: out_path,
+    };
+    if output_is_current(context, &output, &[(pair.source, pair.source_mime)], item) {
+        return Ok(());
+    }
 
     let options = CarryOptions {
         force: context.force,
@@ -616,18 +726,24 @@ fn carry_inner(
         max_pixels: Options::default().max_pixels,
     };
 
-    let outcome = match &context.mode {
-        Mode::Hosted { base, key } => match hosted(context, base, key, &pair, &options, item) {
-            Ok(done) => done,
-            Err(Hosted::Fallback(reason)) => {
-                item.warnings.push(format!(
-                    "hosted signing unavailable ({reason}); signed with a local key. {SIGNER_HINT}"
-                ));
-                local(context, &pair, &options, item)?
-            }
-            Err(Hosted::Failure(failure)) => return Err(failure),
-        },
-        _ => local(context, &pair, &options, item)?,
+    let outcome = match sign_pair(context, &pair, &options, item) {
+        Err(Failure::Refused(Some(rule), _))
+            if context.edited && EDIT_RULES.contains(&rule.as_str()) =>
+        {
+            item.warnings.push(format!(
+                "the output is not shown to be the same picture as the source ({rule}); signed as an edit of it"
+            ));
+            item.sources = item.source.take().into_iter().collect();
+            let title = file_title(source_path).unwrap_or_else(|| COMPONENT_TITLE.into());
+            let parent = carry::Component {
+                bytes: pair.source,
+                mime: pair.source_mime,
+                title: &title,
+            };
+
+            return compose_signed(context, &[parent], &output, item);
+        }
+        other => other?,
     };
 
     if !outcome.source_valid {
@@ -642,6 +758,27 @@ fn carry_inner(
     item.actions = outcome.actions;
     item.distance = outcome.distance;
     Ok(())
+}
+
+fn sign_pair(
+    context: &Run<'_>,
+    pair: &Pair<'_>,
+    options: &CarryOptions,
+    item: &mut Item,
+) -> Result<CarryOutcome, Failure> {
+    match &context.mode {
+        Mode::Hosted { base, key } => match hosted(context, base, key, pair, options, item) {
+            Ok(done) => Ok(done),
+            Err(Hosted::Fallback(reason)) => {
+                item.signer_warnings.push(format!(
+                    "hosted signing unavailable ({reason}); signed with a local key. {SIGNER_HINT}"
+                ));
+                local(context, pair, options, item)
+            }
+            Err(Hosted::Failure(failure)) => Err(failure),
+        },
+        _ => local(context, pair, options, item),
+    }
 }
 
 struct Pair<'a> {
@@ -674,7 +811,7 @@ fn local(
     options: &CarryOptions,
     item: &mut Item,
 ) -> Result<CarryOutcome, Failure> {
-    let (signer, mode) = local_signer(context, item)?;
+    let (signer, mode) = local_signer(context)?;
     let outcome = pair.carry(signer.as_ref(), options)?;
     item.signer_mode = Some(mode);
     Ok(outcome)
@@ -682,24 +819,27 @@ fn local(
 
 type BoxedSigner = Box<dyn c2pa_check_core::c2pa::Signer + Send + Sync>;
 
-fn local_signer(
-    context: &Run<'_>,
-    item: &mut Item,
-) -> Result<(BoxedSigner, &'static str), Failure> {
+fn local_signer(context: &Run<'_>) -> Result<(BoxedSigner, &'static str), Failure> {
     Ok(match &context.mode {
         Mode::Own { chain, key } => (carry::local_signer(chain, key, context.tsa.clone())?, "own"),
-        _ => (local_identity_signer(context, item)?, "local"),
+        _ => (local_identity_signer(context)?, MODE_LOCAL),
     })
 }
 
-fn local_identity_signer(context: &Run<'_>, item: &mut Item) -> Result<BoxedSigner, Failure> {
+fn local_identity_signer(context: &Run<'_>) -> Result<BoxedSigner, Failure> {
     let mut slot = context
         .local
         .lock()
         .map_err(|_| Failure::Error(anyhow!("local identity lock poisoned")))?;
     let identity = match slot.take() {
         Some(identity) => identity,
-        None => load_or_create_identity(item)?,
+        None => {
+            let (identity, note) = load_or_create_identity(identity_dir().as_deref())?;
+            if let Ok(mut pending) = context.identity_note.lock() {
+                *pending = Some(note);
+            }
+            identity
+        }
     };
     let signer = carry::local_signer(&identity.chain_pem, &identity.key_pem, context.tsa.clone());
     *slot = Some(identity);
@@ -710,37 +850,34 @@ fn identity_dir() -> Option<PathBuf> {
     env::config_dir().map(|dir| dir.join("identity"))
 }
 
-fn load_or_create_identity(item: &mut Item) -> Result<LocalIdentity, Failure> {
-    let dir = identity_dir();
-    if let Some(dir) = &dir {
+fn load_or_create_identity(dir: Option<&Path>) -> Result<(LocalIdentity, String), Failure> {
+    if let Some(dir) = dir {
         let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
         if let (Ok(chain_pem), Ok(key_pem)) = (
             std::fs::read_to_string(&cert),
             std::fs::read_to_string(&key),
         ) {
-            item.warnings.push(format!(
-                "signed with the local key in {}; {SIGNER_HINT}",
-                dir.display()
+            return Ok((
+                LocalIdentity { chain_pem, key_pem },
+                format!(
+                    "signed with the local key in {}; {SIGNER_HINT}",
+                    dir.display()
+                ),
             ));
-            return Ok(LocalIdentity { chain_pem, key_pem });
         }
     }
 
     let identity = carry::generate_identity(LOCAL_NAME)?;
-    let saved = dir
-        .as_ref()
-        .is_some_and(|dir| save_identity(dir, &identity).is_ok());
-    item.warnings.push(if saved {
+    let saved = dir.is_some_and(|dir| save_identity(dir, &identity).is_ok());
+    let note = if saved {
         format!(
             "created a local signing key in {}; {SIGNER_HINT}",
-            dir.as_ref()
-                .map(|d| d.display().to_string())
-                .unwrap_or_default()
+            dir.map(|d| d.display().to_string()).unwrap_or_default()
         )
     } else {
         format!("signed with a one-time key that was not saved; {SIGNER_HINT}")
-    });
-    Ok(identity)
+    };
+    Ok((identity, note))
 }
 
 fn save_identity(dir: &Path, identity: &LocalIdentity) -> anyhow::Result<()> {
@@ -1504,55 +1641,16 @@ mod tests {
 
     #[test]
     fn a_hosted_carry_patches_the_returned_signature_and_verifies() {
-        use c2pa::Signer as _;
-
-        let organization = carry::generate_identity("acme.example via c2pa.design").unwrap();
-        let chain_pem = organization.chain_pem.clone();
-        let key_pem = organization.key_pem.clone();
-        let (base, server) = serve(2, move |request| {
-            if request.path.ends_with("/sign/certificate") {
-                return (
-                    200,
-                    serde_json::json!({
-                        "certificate_chain": [chain_pem],
-                        "signer_name": "acme.example via c2pa.design"
-                    })
-                    .to_string(),
-                );
-            }
-            let boundary = request
-                .content_type
-                .split("boundary=")
-                .nth(1)
-                .unwrap_or_default();
-            let tbs = multipart_field(&request.body, boundary, "tbs");
-            assert_eq!(
-                multipart_field(&request.body, boundary, "placeholder").len(),
-                128
-            );
-            let signature = carry::local_signer(&chain_pem, &key_pem, None)
-                .unwrap()
-                .sign(tbs)
-                .unwrap();
-            (
-                200,
-                serde_json::json!({
-                    "signature": base64::engine::general_purpose::STANDARD.encode(signature),
-                    "carry_id": "carry_1",
-                    "signer_name": "acme.example via c2pa.design"
-                })
-                .to_string(),
-            )
-        });
+        let (base, server, sent) = sign_as_organization(2, "carry_1");
 
         let dir = scratch("hosted");
         let generator = carry::generate_identity("Test Generator").unwrap();
-        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
-        std::fs::write(
-            dir.join("hero.webp"),
+        let (source, webp) = (
+            signed_png(&generator),
             encoded(&picture(), image::ImageFormat::WebP),
-        )
-        .unwrap();
+        );
+        std::fs::write(dir.join("hero.png"), &source).unwrap();
+        std::fs::write(dir.join("hero.webp"), &webp).unwrap();
         let verifier = Verifier::new(
             &c2pa_check_core::TrustBundle::default(),
             c2pa_check_core::report::TrustSelector::None,
@@ -1566,7 +1664,9 @@ mod tests {
             },
             tsa: None,
             force: false,
+            edited: false,
             local: Mutex::new(None),
+            identity_note: Mutex::new(None),
             chain: Mutex::new(None),
             warnings: Vec::new(),
         };
@@ -1580,6 +1680,8 @@ mod tests {
         let paths = server.join().unwrap();
         let carried = std::fs::read(dir.join("hero.carried.webp"));
         std::fs::remove_dir_all(&dir).ok();
+        let signing = sent.recv().unwrap();
+        let added = own_overhead(carried.as_deref().unwrap_or_default(), &webp, &source);
 
         assert_eq!(item.status, "carried", "{:?}", item.message);
         assert_eq!(item.signer_mode, Some("hosted"));
@@ -1592,10 +1694,504 @@ mod tests {
         assert_eq!(item.actions, ["c2pa.opened", "c2pa.transcoded"]);
         assert!(item.warnings.is_empty(), "{:?}", item.warnings);
         assert_eq!(paths, ["/v1/sign/certificate", "/v1/sign"]);
+        assert_eq!(signing.placeholder_hex.len(), 128);
+        assert!(added <= LEAN_OVERHEAD, "{added} bytes beyond the source");
         let report = verifier
             .verify(&carried.unwrap(), "image/webp", &Options::default())
             .unwrap();
         assert_eq!(report.ingredients.len(), 1);
+    }
+
+    const LEAN_OVERHEAD: usize = 8 * 1024;
+
+    fn own_overhead(signed: &[u8], unsigned: &[u8], source: &[u8]) -> usize {
+        let plain = encoded(&picture(), image::ImageFormat::Png);
+
+        signed
+            .len()
+            .saturating_sub(unsigned.len())
+            .saturating_sub(source.len().saturating_sub(plain.len()))
+    }
+
+    struct Signing {
+        had_source: bool,
+        derived: Vec<u8>,
+        placeholder_hex: String,
+        signature: Vec<u8>,
+    }
+
+    fn sign_as_organization(
+        requests: usize,
+        carry_id: &'static str,
+    ) -> (
+        String,
+        std::thread::JoinHandle<Vec<String>>,
+        std::sync::mpsc::Receiver<Signing>,
+    ) {
+        use c2pa::Signer as _;
+
+        let organization = carry::generate_identity("acme.example via c2pa.design").unwrap();
+        let (chain_pem, key_pem) = (organization.chain_pem.clone(), organization.key_pem.clone());
+        let (seen, sent) = std::sync::mpsc::channel();
+        let (base, server) = serve(requests, move |request| {
+            if request.path.ends_with("/sign/certificate") {
+                return (
+                    200,
+                    serde_json::json!({"certificate_chain": [chain_pem], "signer_name": "acme.example via c2pa.design"})
+                        .to_string(),
+                );
+            }
+            let boundary = request
+                .content_type
+                .split("boundary=")
+                .nth(1)
+                .unwrap_or_default();
+            let field = |name: &str| multipart_field(&request.body, boundary, name);
+            let signature = carry::local_signer(&chain_pem, &key_pem, None)
+                .unwrap()
+                .sign(field("tbs"))
+                .unwrap();
+            seen.send(Signing {
+                had_source: String::from_utf8_lossy(&request.body).contains("name=\"source\""),
+                derived: field("derived").to_vec(),
+                placeholder_hex: String::from_utf8_lossy(field("placeholder")).into_owned(),
+                signature: signature.clone(),
+            })
+            .unwrap();
+            (
+                200,
+                serde_json::json!({
+                    "signature": base64::engine::general_purpose::STANDARD.encode(signature),
+                    "carry_id": carry_id,
+                    "signer_name": "acme.example via c2pa.design"
+                })
+                .to_string(),
+            )
+        });
+
+        (base, server, sent)
+    }
+
+    fn unreachable_base() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        format!("http://{address}/v1")
+    }
+
+    fn edit_inputs(name: &str) -> PathBuf {
+        let dir = scratch(name);
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        let mut other = picture();
+        other.invert();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&other.fliph(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+
+        dir
+    }
+
+    fn editing(context: Run<'_>) -> Run<'_> {
+        Run {
+            edited: true,
+            ..context
+        }
+    }
+
+    #[test]
+    fn a_credential_adds_little_beyond_the_source_credential() {
+        let dir = scratch("lean");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        let (source, webp) = (
+            signed_png(&generator),
+            encoded(&picture(), image::ImageFormat::WebP),
+        );
+        std::fs::write(dir.join("hero.png"), &source).unwrap();
+        std::fs::write(dir.join("hero.webp"), &webp).unwrap();
+        let verifier = no_trust_verifier();
+        let context = own_context(&verifier);
+
+        let carried = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("carried.webp"),
+        );
+        let composed = compose_one(
+            &context,
+            &[dir.join("hero.png")],
+            &dir.join("hero.webp"),
+            &dir.join("composed.webp"),
+        );
+        let carried_bytes = std::fs::read(dir.join("carried.webp")).unwrap_or_default();
+        let composed_bytes = std::fs::read(dir.join("composed.webp")).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+        let carried_added = own_overhead(&carried_bytes, &webp, &source);
+        let composed_added = own_overhead(&composed_bytes, &webp, &source);
+
+        assert_eq!(carried.status, "carried", "{:?}", carried.message);
+        assert_eq!(composed.status, "composed", "{:?}", composed.message);
+        assert!(carried_bytes.len() > webp.len());
+        assert!(carried_added <= LEAN_OVERHEAD, "carry adds {carried_added}");
+        assert!(
+            composed_added <= LEAN_OVERHEAD,
+            "compose adds {composed_added}"
+        );
+    }
+
+    #[test]
+    fn an_edit_of_the_source_is_signed_in_the_same_call() {
+        let dir = edit_inputs("edit");
+        let verifier = no_trust_verifier();
+        let context = editing(own_context(&verifier));
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        let written = std::fs::read(dir.join("out.webp"));
+        std::fs::remove_dir_all(&dir).ok();
+        let items = [item];
+        let value: Value = serde_json::from_str(&json_document(&items).unwrap()).unwrap();
+        let report = verifier
+            .verify(
+                &written.unwrap(),
+                "image/webp",
+                &Options {
+                    include_raw: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+        let raw = serde_json::to_string(&report.raw_manifest_store).unwrap();
+
+        assert_eq!(value["status"], "composed", "{value}");
+        assert_eq!(value["actions"][0], "c2pa.opened");
+        assert_eq!(value["actions"][1], "c2pa.edited");
+        assert!(value["sources"][0].as_str().unwrap().ends_with("hero.png"));
+        assert!(value.get("source").is_none());
+        assert!(value["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("different_picture"));
+        assert_eq!(exit_code(&items, false), 0);
+        assert_eq!(report.ingredients.len(), 1);
+        assert_eq!(raw.matches("parentOf").count(), 1);
+        assert!(!raw.contains("componentOf"));
+    }
+
+    #[test]
+    fn the_same_picture_is_a_plain_carry_even_when_an_edit_is_allowed() {
+        let dir = scratch("edit-same");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let context = editing(own_context(&verifier));
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(item.status, "carried", "{:?}", item.message);
+        assert_eq!(item.actions, ["c2pa.opened", "c2pa.transcoded"]);
+        assert!(item.warnings.is_empty(), "{:?}", item.warnings);
+    }
+
+    #[test]
+    fn an_unsigned_source_is_refused_before_any_request_even_as_an_edit() {
+        let dir = scratch("edit-unsigned");
+        std::fs::write(
+            dir.join("hero.png"),
+            encoded(&picture(), image::ImageFormat::Png),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let mut context = editing(hosted_context(&verifier, unreachable_base()));
+        context.local = Mutex::new(Some(carry::generate_identity("local").unwrap()));
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        let written = dir.join("out.webp").exists();
+        std::fs::remove_dir_all(&dir).ok();
+        let items = [item];
+
+        assert!(!written);
+        assert_eq!(items[0].status, "refused");
+        assert_eq!(items[0].rule.as_deref(), Some("source_unsigned"));
+        assert!(items[0].warnings.is_empty(), "{:?}", items[0].warnings);
+        assert_eq!(exit_code(&items, false), EXIT_REFUSED);
+    }
+
+    #[test]
+    fn an_edit_that_fell_back_to_the_local_key_says_so_once() {
+        let dir = edit_inputs("fallback-edit");
+        let verifier = no_trust_verifier();
+        let mut context = editing(hosted_context(&verifier, unreachable_base()));
+        context.local = Mutex::new(Some(carry::generate_identity(LOCAL_NAME).unwrap()));
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        let fallbacks = item
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("hosted signing unavailable"))
+            .count();
+
+        assert_eq!(item.status, "composed", "{:?}", item.message);
+        assert_eq!(item.signer_mode, Some("local"));
+        assert_eq!(fallbacks, 1, "{:?}", item.warnings);
+    }
+
+    #[test]
+    fn a_hosted_edit_costs_one_signing_request_and_is_sent_as_a_composite() {
+        let (base, server, sent) = sign_as_organization(2, "carry_3");
+        let dir = edit_inputs("hosted-edit");
+        let verifier = no_trust_verifier();
+        let context = editing(hosted_context(&verifier, base));
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        let paths = server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let signing = sent.recv().unwrap();
+
+        assert_eq!(item.status, "composed", "{:?}", item.message);
+        assert_eq!(item.signer_mode, Some("hosted"));
+        assert_eq!(item.actions, ["c2pa.opened", "c2pa.edited"]);
+        assert_eq!(paths, ["/v1/sign/certificate", "/v1/sign"]);
+        assert!(!signing.had_source);
+    }
+
+    #[test]
+    fn a_folder_carries_the_signed_originals_and_passes_over_the_unsigned() {
+        let dir = scratch("folder");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("src/signed.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("src/plain.png"),
+            encoded(&picture(), image::ImageFormat::Png),
+        )
+        .unwrap();
+        let webp = encoded(&picture(), image::ImageFormat::WebP);
+        std::fs::write(dir.join("out/signed.webp"), &webp).unwrap();
+        std::fs::write(dir.join("out/plain.webp"), &webp).unwrap();
+        let verifier = no_trust_verifier();
+        let context = own_context(&verifier);
+
+        let items = batch(
+            &context,
+            &dir.join("src"),
+            &[format!("{}/out/*.webp", dir.display())],
+        )
+        .unwrap();
+        let plain_after = std::fs::read(dir.join("out/plain.webp")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let status = |name: &str| {
+            items
+                .iter()
+                .find(|i| i.derived.ends_with(name))
+                .map(|i| (i.status, i.rule.clone()))
+        };
+
+        assert_eq!(status("signed.webp"), Some(("carried", None)));
+        assert_eq!(status("plain.webp"), Some(("unsigned", None)));
+        assert_eq!(plain_after, webp);
+        assert_eq!(exit_code(&items, false), 0);
+        assert_eq!(exit_code(&items, true), EXIT_UNPAIRED);
+    }
+
+    #[test]
+    fn a_rerun_keeps_the_signed_output_and_sends_nothing() {
+        let dir = scratch("rerun");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let run = |context: &Run<'_>| {
+            carry_one(
+                context,
+                &dir.join("hero.png"),
+                &dir.join("hero.webp"),
+                &dir.join("shipped.webp"),
+            )
+        };
+
+        let first = run(&own_context(&verifier));
+        let shipped = std::fs::read(dir.join("shipped.webp")).unwrap();
+        let second = run(&hosted_context(&verifier, unreachable_base()));
+        let kept = std::fs::read(dir.join("shipped.webp")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(first.status, "carried", "{:?}", first.message);
+        assert_eq!(second.status, "skipped", "{:?}", second.message);
+        assert!(second.out.as_deref().unwrap().ends_with("shipped.webp"));
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+        assert_eq!(kept, shipped);
+    }
+
+    #[test]
+    fn a_rerun_of_an_edit_and_of_a_composite_is_skipped() {
+        let dir = edit_inputs("rerun-edit");
+        std::fs::write(
+            dir.join("part.png"),
+            encoded(&picture(), image::ImageFormat::Png),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let context = editing(own_context(&verifier));
+        let edit = || {
+            carry_one(
+                &context,
+                &dir.join("hero.png"),
+                &dir.join("hero.webp"),
+                &dir.join("edit.webp"),
+            )
+        };
+        let sources = [dir.join("hero.png"), dir.join("part.png")];
+        let atlas = || {
+            compose_one(
+                &context,
+                &sources,
+                &dir.join("hero.webp"),
+                &dir.join("atlas.webp"),
+            )
+        };
+
+        let (edit_first, atlas_first) = (edit(), atlas());
+        let signed = (
+            std::fs::read(dir.join("edit.webp")).unwrap(),
+            std::fs::read(dir.join("atlas.webp")).unwrap(),
+        );
+        let (edit_again, atlas_again) = (edit(), atlas());
+        let after = (
+            std::fs::read(dir.join("edit.webp")).unwrap(),
+            std::fs::read(dir.join("atlas.webp")).unwrap(),
+        );
+        let fewer_sources = compose_one(
+            &context,
+            &sources[..1],
+            &dir.join("hero.webp"),
+            &dir.join("atlas.webp"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(edit_first.status, "composed", "{:?}", edit_first.message);
+        assert_eq!(atlas_first.status, "composed", "{:?}", atlas_first.message);
+        assert_eq!(edit_again.status, "skipped", "{:?}", edit_again.message);
+        assert_eq!(atlas_again.status, "skipped", "{:?}", atlas_again.message);
+        assert_eq!(after, signed);
+        assert_eq!(fewer_sources.status, "composed");
+    }
+
+    #[test]
+    fn changed_pixels_are_signed_again() {
+        let dir = scratch("rerun-changed");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let context = own_context(&verifier);
+        let run = || {
+            carry_one(
+                &context,
+                &dir.join("hero.png"),
+                &dir.join("hero.webp"),
+                &dir.join("shipped.webp"),
+            )
+        };
+
+        let first = run();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&picture().brighten(3), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let second = run();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(first.status, "carried", "{:?}", first.message);
+        assert_eq!(second.status, "carried", "{:?}", second.message);
+    }
+
+    #[test]
+    fn a_local_signature_is_replaced_once_a_better_signer_is_configured() {
+        let dir = scratch("rerun-upgrade");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let local = || Run {
+            mode: Mode::Local,
+            local: Mutex::new(Some(carry::generate_identity(LOCAL_NAME).unwrap())),
+            identity_note: Mutex::new(None),
+            ..own_context(&verifier)
+        };
+        let run = |context: &Run<'_>| {
+            carry_one(
+                context,
+                &dir.join("hero.png"),
+                &dir.join("hero.webp"),
+                &dir.join("shipped.webp"),
+            )
+        };
+
+        let first = run(&local());
+        let still_local = run(&local());
+        let upgraded = run(&own_context(&verifier));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(first.status, "carried", "{:?}", first.message);
+        assert_eq!(first.signer_mode, Some("local"));
+        assert_eq!(still_local.status, "skipped");
+        assert_eq!(upgraded.status, "carried", "{:?}", upgraded.message);
+        assert_eq!(upgraded.signer.as_deref(), Some("acme.example"));
     }
 
     fn hosted_context<'a>(verifier: &'a Verifier, base: String) -> Run<'a> {
@@ -1607,7 +2203,9 @@ mod tests {
             },
             tsa: None,
             force: false,
+            edited: false,
             local: Mutex::new(None),
+            identity_note: Mutex::new(None),
             chain: Mutex::new(None),
             warnings: Vec::new(),
         }
@@ -1634,47 +2232,7 @@ mod tests {
 
     #[test]
     fn a_hosted_composite_is_sent_without_a_source_and_passes_the_hosted_policy() {
-        use c2pa::Signer as _;
-
-        let organization = carry::generate_identity("acme.example via c2pa.design").unwrap();
-        let (chain_pem, key_pem) = (organization.chain_pem.clone(), organization.key_pem.clone());
-        let (seen, sent) = std::sync::mpsc::channel();
-        let (base, server) = serve(2, move |request| {
-            if request.path.ends_with("/sign/certificate") {
-                return (
-                    200,
-                    serde_json::json!({"certificate_chain": [chain_pem], "signer_name": "acme.example via c2pa.design"})
-                        .to_string(),
-                );
-            }
-            let boundary = request
-                .content_type
-                .split("boundary=")
-                .nth(1)
-                .unwrap_or_default();
-            let signature = carry::local_signer(&chain_pem, &key_pem, None)
-                .unwrap()
-                .sign(multipart_field(&request.body, boundary, "tbs"))
-                .unwrap();
-            let placeholder =
-                hex::decode(multipart_field(&request.body, boundary, "placeholder")).unwrap();
-            seen.send((
-                String::from_utf8_lossy(&request.body).contains("name=\"source\""),
-                multipart_field(&request.body, boundary, "derived").to_vec(),
-                placeholder,
-                signature.clone(),
-            ))
-            .unwrap();
-            (
-                200,
-                serde_json::json!({
-                    "signature": base64::engine::general_purpose::STANDARD.encode(signature),
-                    "carry_id": "carry_2",
-                    "signer_name": "acme.example via c2pa.design"
-                })
-                .to_string(),
-            )
-        });
+        let (base, server, sent) = sign_as_organization(2, "carry_2");
         let (dir, sources) = atlas_inputs("hosted-compose");
         let verifier = no_trust_verifier();
 
@@ -1683,17 +2241,17 @@ mod tests {
             &sources,
             &dir.join("atlas.webp"),
             &dir.join("signed.webp"),
-            false,
         );
         let paths = server.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
-        let (had_source, pending, placeholder, signature) = sent.recv().unwrap();
+        let signing = sent.recv().unwrap();
+        let placeholder = hex::decode(&signing.placeholder_hex).unwrap();
         let verdict = verifier.compose_check(
             &carry::ComposeInput {
-                composite: &pending,
+                composite: &signing.derived,
                 mime: "image/webp",
                 placeholder: &placeholder,
-                signature: &signature,
+                signature: &signing.signature,
             },
             &Options::default(),
         );
@@ -1707,7 +2265,7 @@ mod tests {
             Some(CredentialStatus::ValidUntrusted)
         );
         assert_eq!(paths, ["/v1/sign/certificate", "/v1/sign"]);
-        assert!(!had_source);
+        assert!(!signing.had_source);
         assert!(verdict.accepted, "{} {}", verdict.rule, verdict.detail);
     }
 
@@ -1730,7 +2288,6 @@ mod tests {
             &sources,
             &dir.join("atlas.webp"),
             &dir.join("signed.webp"),
-            false,
         );
         server.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -1768,14 +2325,16 @@ mod tests {
             &sources,
             &dir.join("atlas.webp"),
             &dir.join("created.webp"),
-            false,
         );
+        let editing = Run {
+            edited: true,
+            ..own_context(&verifier)
+        };
         let edited = compose_one(
-            &context,
+            &editing,
             &sources,
             &dir.join("atlas.webp"),
             &dir.join("edited.webp"),
-            true,
         );
         let created_bytes = std::fs::read(dir.join("created.webp"));
         let edited_bytes = std::fs::read(dir.join("edited.webp"));
@@ -1839,7 +2398,9 @@ mod tests {
             },
             tsa: None,
             force: false,
+            edited: false,
             local: Mutex::new(None),
+            identity_note: Mutex::new(None),
             chain: Mutex::new(None),
             warnings: Vec::new(),
         }
@@ -1892,6 +2453,164 @@ mod tests {
         assert_eq!(EXIT_REFUSED, 5);
     }
 
+    const INPUT_WARNING: &str = "C2PA_SIGN_CERT and C2PA_SIGN_KEY must both be set; ignoring them";
+
+    #[test]
+    fn a_refusal_with_the_local_key_reports_no_signer_warning() {
+        let dir = edit_inputs("refused-local");
+        let verifier = no_trust_verifier();
+        let context = Run {
+            mode: Mode::Local,
+            local: Mutex::new(Some(carry::generate_identity(LOCAL_NAME).unwrap())),
+            identity_note: Mutex::new(None),
+            warnings: vec![INPUT_WARNING.into()],
+            ..own_context(&verifier)
+        };
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(item.status, "refused");
+        assert_eq!(item.rule.as_deref(), Some("different_picture"));
+        assert_eq!(item.warnings, [INPUT_WARNING]);
+    }
+
+    #[test]
+    fn a_carry_that_fell_back_to_the_local_key_says_so() {
+        let dir = scratch("fallback-carried");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        std::fs::write(
+            dir.join("hero.webp"),
+            encoded(&picture(), image::ImageFormat::WebP),
+        )
+        .unwrap();
+        let verifier = no_trust_verifier();
+        let mut context = hosted_context(&verifier, unreachable_base());
+        context.local = Mutex::new(Some(carry::generate_identity(LOCAL_NAME).unwrap()));
+        context.warnings = vec![INPUT_WARNING.into()];
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        let items = [item];
+        let value: Value = serde_json::from_str(&json_document(&items).unwrap()).unwrap();
+
+        assert_eq!(items[0].status, "carried", "{:?}", items[0].message);
+        assert_eq!(items[0].signer_mode, Some("local"));
+        assert_eq!(items[0].warnings.len(), 2, "{:?}", items[0].warnings);
+        assert_eq!(items[0].warnings[0], INPUT_WARNING);
+        assert!(
+            items[0].warnings[1].starts_with("hosted signing unavailable (network"),
+            "{:?}",
+            items[0].warnings
+        );
+        assert_eq!(value["warnings"], serde_json::json!(items[0].warnings));
+        assert!(value.get("signer_warnings").is_none());
+    }
+
+    #[test]
+    fn a_hosted_fallback_that_ends_in_a_refusal_reports_no_signer_warning() {
+        let dir = edit_inputs("fallback-refused");
+        let verifier = no_trust_verifier();
+        let mut context = hosted_context(&verifier, unreachable_base());
+        context.local = Mutex::new(Some(carry::generate_identity(LOCAL_NAME).unwrap()));
+        context.warnings = vec![INPUT_WARNING.into()];
+
+        let item = carry_one(
+            &context,
+            &dir.join("hero.png"),
+            &dir.join("hero.webp"),
+            &dir.join("out.webp"),
+        );
+        let written = dir.join("out.webp").exists();
+        std::fs::remove_dir_all(&dir).ok();
+        let items = [item];
+        let value: Value = serde_json::from_str(&json_document(&items).unwrap()).unwrap();
+
+        assert!(!written);
+        assert_eq!(items[0].status, "refused");
+        assert_eq!(items[0].rule.as_deref(), Some("different_picture"));
+        assert_eq!(items[0].warnings, [INPUT_WARNING]);
+        assert_eq!(value["warnings"], serde_json::json!([INPUT_WARNING]));
+        assert!(value.get("signer_warnings").is_none());
+    }
+
+    #[test]
+    fn a_local_key_warning_waits_for_the_first_file_signed_with_that_key() {
+        let dir = scratch("identity");
+        let verifier = no_trust_verifier();
+        let run = |dir: Option<&Path>| {
+            let context = Run {
+                mode: Mode::Local,
+                ..own_context(&verifier)
+            };
+            let (_, note) = load_or_create_identity(dir).ok()?;
+            *context.identity_note.lock().ok()? = Some(note);
+            let settled = |status: &'static str, mode: Option<&'static str>, result| {
+                let mut report = item(status);
+                report.signer_mode = mode;
+                settle(&context, report, result).warnings
+            };
+
+            Some([
+                settled(
+                    "",
+                    None,
+                    Err(Failure::Refused(None, "not the same picture".into())),
+                ),
+                settled("", None, Err(Failure::Error(anyhow!("disk full")))),
+                settled("carried", Some("own"), Ok(())),
+                settled("composed", Some(MODE_LOCAL), Ok(())),
+                settled("carried", Some(MODE_LOCAL), Ok(())),
+            ])
+        };
+
+        let one_time = run(None);
+        let created = run(Some(&dir));
+        let reused = run(Some(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+        let note_of = |warnings: Option<[Vec<String>; 5]>| {
+            let [refused, failed, other_signer, first_local, second_local] = warnings?;
+
+            (refused.is_empty()
+                && failed.is_empty()
+                && other_signer.is_empty()
+                && second_local.is_empty())
+            .then_some(first_local)
+        };
+
+        assert_eq!(
+            note_of(one_time),
+            Some(vec![format!(
+                "signed with a one-time key that was not saved; {SIGNER_HINT}"
+            )])
+        );
+        assert_eq!(
+            note_of(created),
+            Some(vec![format!(
+                "created a local signing key in {}; {SIGNER_HINT}",
+                dir.display()
+            )])
+        );
+        assert_eq!(
+            note_of(reused),
+            Some(vec![format!(
+                "signed with the local key in {}; {SIGNER_HINT}",
+                dir.display()
+            )])
+        );
+    }
+
     #[test]
     fn a_carried_file_reports_output_signer_and_credential_status_in_json() {
         let dir = scratch("carried-json");
@@ -1936,7 +2655,6 @@ mod tests {
             &sources,
             Path::new("/nonexistent/atlas.png"),
             Path::new("/nonexistent/out.png"),
-            false,
         );
 
         assert_eq!(item.status, "error");
@@ -1953,7 +2671,6 @@ mod tests {
             &[PathBuf::from("/nonexistent/a.png")],
             Path::new("/nonexistent/atlas.png"),
             Path::new("/nonexistent/out.png"),
-            false,
         );
 
         assert_eq!(item.status, "error");

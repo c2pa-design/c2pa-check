@@ -53,6 +53,10 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          for _ in $(seq 30); do
+            npm view "c2pa-check@$version" version >/dev/null 2>&1 && break
+            sleep 10
+          done
           mkdir verify && cd verify && npm init -y >/dev/null
           npm install --no-save "c2pa-check@$version"
           npm audit signatures
@@ -94,3 +98,34 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" out/* --clobber
+
+  tap:
+    needs: github
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+    steps:
+      - name: Skip without a tap token
+        if: env.TAP_TOKEN == ''
+        run: echo "::notice::TAP_TOKEN is not set; the Homebrew formula was not updated"
+      - uses: actions/checkout@v5
+        if: env.TAP_TOKEN != ''
+        with:
+          repository: c2pa-design/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+      - name: Point the formula at this release
+        if: env.TAP_TOKEN != ''
+        run: |
+          set -euo pipefail
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          sed -i -E "s|^  url \".*\"|  url \"$url\"|; s|^  sha256 \".*\"|  sha256 \"$sha\"|" Formula/c2pa-check.rb
+          if git diff --quiet; then
+            echo "::notice::the formula already points at ${GITHUB_REF_NAME}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "c2pa-check ${GITHUB_REF_NAME#v}"
+          git push

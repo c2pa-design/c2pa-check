@@ -266,9 +266,7 @@ fn main() -> ExitCode {
         }
         Err(_) => EXIT_CRASH,
     };
-    let silent = matches!(code, 0 | EXIT_EXPECTATION)
-        || matches!(command, "doctor" | "mcp" | telemetry::SEND_COMMAND);
-    if !silent {
+    if telemetry::reportable(command, code) {
         telemetry::report(command, code, offline);
     }
 

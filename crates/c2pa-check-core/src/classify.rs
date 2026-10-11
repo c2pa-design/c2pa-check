@@ -2,6 +2,8 @@ use crate::report::{CredentialStatus, SourceCategory};
 
 const IPTC_PREFIX: &str = "http://cv.iptc.org/newscodes/digitalsourcetype/";
 
+const PLAIN_COMPOSITE: &str = "composite";
+
 const SOURCE_TYPES: &[(&str, SourceCategory)] = &[
     ("trainedAlgorithmicMedia", SourceCategory::AiGenerated),
     (
@@ -15,7 +17,7 @@ const SOURCE_TYPES: &[(&str, SourceCategory)] = &[
     ("positiveFilm", SourceCategory::Camera),
     ("print", SourceCategory::Camera),
     ("softwareImage", SourceCategory::Software),
-    ("composite", SourceCategory::Software),
+    (PLAIN_COMPOSITE, SourceCategory::Software),
     ("compositeCapture", SourceCategory::Software),
     ("minorHumanEdits", SourceCategory::Software),
     ("humanEdits", SourceCategory::Software),
@@ -57,10 +59,13 @@ fn rank(category: SourceCategory) -> u8 {
     }
 }
 
+fn slug(uri: &str) -> &str {
+    uri.strip_prefix(IPTC_PREFIX)
+        .unwrap_or_else(|| uri.rsplit('/').next().unwrap_or(uri))
+}
+
 pub fn category_of(uri: &str) -> Option<SourceCategory> {
-    let slug = uri
-        .strip_prefix(IPTC_PREFIX)
-        .unwrap_or_else(|| uri.rsplit('/').next().unwrap_or(uri));
+    let slug = slug(uri);
 
     SOURCE_TYPES
         .iter()
@@ -74,6 +79,17 @@ pub fn strongest(current: SourceCategory, candidate: SourceCategory) -> SourceCa
     } else {
         current
     }
+}
+
+pub fn is_ai(category: SourceCategory) -> bool {
+    matches!(
+        category,
+        SourceCategory::AiGenerated | SourceCategory::AiComposite | SourceCategory::AiEnhanced
+    )
+}
+
+pub fn is_plain_composite(uri: &str) -> bool {
+    slug(uri) == PLAIN_COMPOSITE
 }
 
 pub fn from_generator(generator: &str) -> Option<SourceCategory> {

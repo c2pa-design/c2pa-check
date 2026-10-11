@@ -50,6 +50,7 @@
       "type": "object",
       "properties": {
         "generator": { "type": "string" },
+        "title": { "type": "string", "maxLength": 200 },
         "spec_version": { "type": "string" },
         "signed_at": { "type": "string" },
         "timestamp_authority": { "type": "string" },
@@ -61,7 +62,8 @@
       "required": ["category"],
       "properties": {
         "digital_source_type": { "type": "string" },
-        "category": { "$ref": "#/$defs/sourceCategory" }
+        "category": { "$ref": "#/$defs/sourceCategory" },
+        "inherited": { "type": "boolean" }
       }
     },
     "actions": {
