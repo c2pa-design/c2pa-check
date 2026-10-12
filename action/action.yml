@@ -18,6 +18,10 @@ inputs:
     description: Fail when fewer than this percentage of targets are trusted (with paths or urls; c2pa.json sets its own).
     required: false
     default: "100"
+  coverage-metric:
+    description: What coverage counts, trusted (default), traced or valid (with paths or urls; c2pa.json sets its own).
+    required: false
+    default: ""
   baseline:
     description: Baseline file; fail when a file that had a valid credential in it has lost it (with paths).
     required: false
@@ -51,9 +55,9 @@ inputs:
     required: false
     default: ""
   version:
-    description: Release tag of c2pa-check to run (e.g. v0.4.0), or latest.
+    description: Release tag of c2pa-check to run (e.g. v0.5.0), or latest.
     required: false
-    default: v0.4.0
+    default: v0.5.0
 
 outputs:
   coverage:
@@ -122,6 +126,7 @@ runs:
         INPUT_TRUST: ${{ inputs.trust }}
         INPUT_FORMAT: ${{ inputs.format }}
         INPUT_COVERAGE: ${{ inputs.coverage }}
+        INPUT_COVERAGE_METRIC: ${{ inputs.coverage-metric }}
         INPUT_EXPECT: ${{ inputs.expect }}
         INPUT_PATHS: ${{ inputs.paths }}
         INPUT_URLS: ${{ inputs.urls }}
@@ -146,6 +151,7 @@ runs:
           fi
         else
           if [ -n "$INPUT_COVERAGE" ]; then args+=(--coverage "$INPUT_COVERAGE"); fi
+          if [ -n "$INPUT_COVERAGE_METRIC" ]; then args+=(--coverage-metric "$INPUT_COVERAGE_METRIC"); fi
           if [ -n "$INPUT_EXPECT" ]; then args+=(--expect "$INPUT_EXPECT"); fi
           if [ -n "$INPUT_BASELINE" ]; then args+=(--baseline "$INPUT_BASELINE"); fi
         fi

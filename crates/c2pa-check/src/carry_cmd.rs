@@ -16,6 +16,7 @@ use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::api::Api;
 use crate::env;
 
 pub const EXIT_REFUSED: u8 = 5;
@@ -111,9 +112,23 @@ pub struct KeygenArgs {
 
 #[derive(Clone)]
 enum Mode {
-    Own { chain: String, key: String },
-    Hosted { base: String, key: String },
+    Own {
+        chain: String,
+        key: String,
+    },
+    Hosted {
+        base: String,
+        key: String,
+        project: Option<String>,
+    },
     Local,
+}
+
+#[derive(Clone, Copy)]
+struct Endpoint<'a> {
+    base: &'a str,
+    key: &'a str,
+    project: Option<&'a str>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -160,8 +175,8 @@ struct Run<'a> {
     warnings: Vec<String>,
 }
 
-pub fn run(args: CarryArgs, verifier: &Verifier) -> anyhow::Result<u8> {
-    let (mode, warnings) = mode_from_env();
+pub fn run(args: CarryArgs, verifier: &Verifier, project: Option<String>) -> anyhow::Result<u8> {
+    let (mode, warnings) = mode_from_env(project);
     let context = Run {
         verifier,
         mode,
@@ -565,7 +580,16 @@ fn compose_signed(
         title: title.as_deref(),
     };
     let hosted = match &context.mode {
-        Mode::Hosted { base, key } => match hosted_compose(context, base, key, &work, item) {
+        Mode::Hosted { base, key, project } => match hosted_compose(
+            context,
+            Endpoint {
+                base,
+                key,
+                project: project.as_deref(),
+            },
+            &work,
+            item,
+        ) {
             Ok(done) => Some(done),
             Err(Hosted::Fallback(reason)) => {
                 item.signer_warnings.push(format!(
@@ -767,7 +791,17 @@ fn sign_pair(
     item: &mut Item,
 ) -> Result<CarryOutcome, Failure> {
     match &context.mode {
-        Mode::Hosted { base, key } => match hosted(context, base, key, pair, options, item) {
+        Mode::Hosted { base, key, project } => match hosted(
+            context,
+            Endpoint {
+                base,
+                key,
+                project: project.as_deref(),
+            },
+            pair,
+            options,
+            item,
+        ) {
             Ok(done) => Ok(done),
             Err(Hosted::Fallback(reason)) => {
                 item.signer_warnings.push(format!(
@@ -940,13 +974,16 @@ impl From<Failure> for Hosted {
 
 fn hosted(
     context: &Run<'_>,
-    base: &str,
-    key: &str,
+    endpoint: Endpoint<'_>,
     pair: &Pair<'_>,
     options: &CarryOptions,
     item: &mut Item,
 ) -> Result<CarryOutcome, Hosted> {
-    let (chain, signer_name) = certificate(context, base, key)?;
+    let (chain, signer_name, project) = certificate(context, endpoint)?;
+    let endpoint = Endpoint {
+        project: project.as_deref(),
+        ..endpoint
+    };
 
     let placeholder = carry::new_placeholder().map_err(|e| Hosted::Failure(e.into()))?;
     let signer = DeferredSigner::new(chain, placeholder);
@@ -959,19 +996,22 @@ fn hosted(
         mime: pair.derived_mime,
         signer_name,
     };
-    let bytes = countersign(base, key, &signer, &pending, item)?;
+    let bytes = countersign(endpoint, &signer, &pending, item)?;
 
     Ok(CarryOutcome { bytes, ..outcome })
 }
 
 fn hosted_compose(
     context: &Run<'_>,
-    base: &str,
-    key: &str,
+    endpoint: Endpoint<'_>,
     work: &Composite<'_>,
     item: &mut Item,
 ) -> Result<ComposeOutcome, Hosted> {
-    let (chain, signer_name) = certificate(context, base, key)?;
+    let (chain, signer_name, project) = certificate(context, endpoint)?;
+    let endpoint = Endpoint {
+        project: project.as_deref(),
+        ..endpoint
+    };
 
     let placeholder = carry::new_placeholder().map_err(|e| Hosted::Failure(e.into()))?;
     let signer = DeferredSigner::new(chain, placeholder);
@@ -984,7 +1024,7 @@ fn hosted_compose(
         mime: work.output_mime,
         signer_name,
     };
-    let bytes = countersign(base, key, &signer, &pending, item)?;
+    let bytes = countersign(endpoint, &signer, &pending, item)?;
 
     Ok(ComposeOutcome { bytes, ..outcome })
 }
@@ -997,8 +1037,7 @@ struct Pending<'a> {
 }
 
 fn countersign(
-    base: &str,
-    key: &str,
+    endpoint: Endpoint<'_>,
     signer: &DeferredSigner,
     pending: &Pending<'_>,
     item: &mut Item,
@@ -1042,11 +1081,14 @@ fn countersign(
         None,
         hex::encode(signer.placeholder()).as_bytes(),
     );
+    if let Some(project) = endpoint.project {
+        part(&mut body, &boundary, "project_id", None, project.as_bytes());
+    }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
     let response = call(
-        &format!("{}/sign", base.trim_end_matches('/')),
-        key,
+        &format!("{}/sign", endpoint.base.trim_end_matches('/')),
+        endpoint.key,
         &format!("multipart/form-data; boundary={boundary}"),
         &body,
     )?;
@@ -1075,9 +1117,20 @@ fn countersign(
     Ok(bytes)
 }
 
-type Certificate = (Vec<Vec<u8>>, Option<String>);
+type Certificate = (Vec<Vec<u8>>, Option<String>, Option<String>);
 
-fn certificate(context: &Run<'_>, base: &str, key: &str) -> Result<Certificate, Hosted> {
+fn resolved_project(endpoint: Endpoint<'_>) -> Result<Option<String>, Hosted> {
+    let api = Api::new(endpoint.base.to_string(), endpoint.key.to_string())
+        .with_project(endpoint.project.map(str::to_string));
+
+    match api.project_id() {
+        Ok(id) => Ok(id.map(str::to_string)),
+        Err(err) if err.code.is_empty() => Err(Hosted::Fallback(format!("project: {err}"))),
+        Err(err) => Err(Hosted::Fallback(err.code)),
+    }
+}
+
+fn certificate(context: &Run<'_>, endpoint: Endpoint<'_>) -> Result<Certificate, Hosted> {
     let mut cached = context
         .chain
         .lock()
@@ -1086,11 +1139,16 @@ fn certificate(context: &Run<'_>, base: &str, key: &str) -> Result<Certificate, 
         return Ok(chain.clone());
     }
 
+    let project = resolved_project(endpoint)?;
+    let request = match &project {
+        Some(id) => serde_json::json!({ "project_id": id }),
+        None => serde_json::json!({}),
+    };
     let response = call(
-        &format!("{}/sign/certificate", base.trim_end_matches('/')),
-        key,
+        &format!("{}/sign/certificate", endpoint.base.trim_end_matches('/')),
+        endpoint.key,
         "application/json",
-        b"{}",
+        request.to_string().as_bytes(),
     )?;
     let pems: Vec<&str> = response
         .get("certificate_chain")
@@ -1104,8 +1162,8 @@ fn certificate(context: &Run<'_>, base: &str, key: &str) -> Result<Certificate, 
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .map(str::to_string);
-    *cached = Some((chain.clone(), name.clone()));
-    Ok((chain, name))
+    *cached = Some((chain.clone(), name.clone(), project.clone()));
+    Ok((chain, name, project))
 }
 
 fn part(body: &mut Vec<u8>, boundary: &str, name: &str, file: Option<(&str, &str)>, bytes: &[u8]) {
@@ -1232,7 +1290,7 @@ fn pem_from_env(name: &str) -> anyhow::Result<Option<(String, Option<PathBuf>)>>
     }
 }
 
-fn mode_from_env() -> (Mode, Vec<String>) {
+fn mode_from_env(project: Option<String>) -> (Mode, Vec<String>) {
     let mut warnings = Vec::new();
     match (
         pem_from_env("C2PA_SIGN_CERT"),
@@ -1263,6 +1321,7 @@ fn mode_from_env() -> (Mode, Vec<String>) {
             Mode::Hosted {
                 base: env::api_base(),
                 key,
+                project,
             },
             warnings,
         );
@@ -1661,6 +1720,7 @@ mod tests {
             mode: Mode::Hosted {
                 base,
                 key: "c2pa_test_key".into(),
+                project: None,
             },
             tsa: None,
             force: false,
@@ -1694,6 +1754,8 @@ mod tests {
         assert_eq!(item.actions, ["c2pa.opened", "c2pa.transcoded"]);
         assert!(item.warnings.is_empty(), "{:?}", item.warnings);
         assert_eq!(paths, ["/v1/sign/certificate", "/v1/sign"]);
+        assert_eq!(signing.project, None);
+        assert_eq!(signing.certificate_request, serde_json::json!({}));
         assert_eq!(signing.placeholder_hex.len(), 128);
         assert!(added <= LEAN_OVERHEAD, "{added} bytes beyond the source");
         let report = verifier
@@ -1703,6 +1765,58 @@ mod tests {
     }
 
     const LEAN_OVERHEAD: usize = 8 * 1024;
+
+    #[test]
+    fn a_hosted_carry_resolves_the_named_project_once_and_sends_it_with_both_calls() {
+        let (base, server, sent) = sign_as_organization(4, "carry_p");
+        let dir = scratch("hosted-project");
+        let generator = carry::generate_identity("Test Generator").unwrap();
+        std::fs::write(dir.join("hero.png"), signed_png(&generator)).unwrap();
+        for name in ["a.webp", "b.webp"] {
+            std::fs::write(
+                dir.join(name),
+                encoded(&picture(), image::ImageFormat::WebP),
+            )
+            .unwrap();
+        }
+        let verifier = no_trust_verifier();
+        let mut context = hosted_context(&verifier, base);
+        if let Mode::Hosted { project, .. } = &mut context.mode {
+            *project = Some("Storefront".into());
+        }
+
+        let items: Vec<Item> = ["a", "b"]
+            .iter()
+            .map(|name| {
+                carry_one(
+                    &context,
+                    &dir.join("hero.png"),
+                    &dir.join(format!("{name}.webp")),
+                    &dir.join(format!("{name}.carried.webp")),
+                )
+            })
+            .collect();
+        let paths = server.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(items.iter().all(|item| item.status == "carried"));
+        assert_eq!(
+            paths,
+            [
+                "/v1/projects",
+                "/v1/sign/certificate",
+                "/v1/sign",
+                "/v1/sign"
+            ]
+        );
+        for signing in sent.try_iter() {
+            assert_eq!(signing.project.as_deref(), Some("p-1"));
+            assert_eq!(
+                signing.certificate_request,
+                serde_json::json!({"project_id": "p-1"})
+            );
+        }
+    }
 
     fn own_overhead(signed: &[u8], unsigned: &[u8], source: &[u8]) -> usize {
         let plain = encoded(&picture(), image::ImageFormat::Png);
@@ -1718,6 +1832,8 @@ mod tests {
         derived: Vec<u8>,
         placeholder_hex: String,
         signature: Vec<u8>,
+        project: Option<String>,
+        certificate_request: Value,
     }
 
     fn sign_as_organization(
@@ -1733,8 +1849,14 @@ mod tests {
         let organization = carry::generate_identity("acme.example via c2pa.design").unwrap();
         let (chain_pem, key_pem) = (organization.chain_pem.clone(), organization.key_pem.clone());
         let (seen, sent) = std::sync::mpsc::channel();
+        let certificate_request = Mutex::new(Value::Null);
         let (base, server) = serve(requests, move |request| {
+            if request.path.ends_with("/projects") {
+                return (201, r#"{"id":"p-1","name":"Storefront"}"#.to_string());
+            }
             if request.path.ends_with("/sign/certificate") {
+                *certificate_request.lock().unwrap() =
+                    serde_json::from_slice(&request.body).unwrap_or(Value::Null);
                 return (
                     200,
                     serde_json::json!({"certificate_chain": [chain_pem], "signer_name": "acme.example via c2pa.design"})
@@ -1756,6 +1878,10 @@ mod tests {
                 derived: field("derived").to_vec(),
                 placeholder_hex: String::from_utf8_lossy(field("placeholder")).into_owned(),
                 signature: signature.clone(),
+                project: String::from_utf8_lossy(&request.body)
+                    .contains("name=\"project_id\"")
+                    .then(|| String::from_utf8_lossy(field("project_id")).into_owned()),
+                certificate_request: certificate_request.lock().unwrap().clone(),
             })
             .unwrap();
             (
@@ -2200,6 +2326,7 @@ mod tests {
             mode: Mode::Hosted {
                 base,
                 key: "c2pa_test_key".into(),
+                project: None,
             },
             tsa: None,
             force: false,

@@ -232,6 +232,46 @@ fn text(value: Option<&Value>) -> Option<&str> {
     .filter(|s| !s.is_empty())
 }
 
+fn refusal_reason(body: &Value) -> String {
+    let detail = |name: &str| {
+        body.pointer(&format!("/error/details/{name}"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+
+    if let Some(reason) = detail("reason") {
+        return match reason {
+            "revoked" => "the key is revoked; create a new one".to_string(),
+            "unknown" => "no such key; check C2PA_API_KEY and C2PA_API_BASE".to_string(),
+            "malformed" => "the key is malformed".to_string(),
+            other => other.to_string(),
+        };
+    }
+    if let Some(scope) = detail("scope") {
+        return format!("the key lacks the {scope} scope");
+    }
+    if let Some(name) = detail("name") {
+        return format!("project {name} is archived; restore it or use another key");
+    }
+
+    "the API gave no reason".to_string()
+}
+
+fn project(body: &Value, archived: bool) -> Option<String> {
+    let resolved = body.get("resolved_project");
+    let name = text(resolved).or_else(|| text(body.get("project")))?;
+    let fallback = resolved
+        .and_then(|found| found.get("default"))
+        .and_then(Value::as_bool)
+        == Some(true);
+
+    Some(match (archived, fallback) {
+        (true, _) => format!("project {name} is archived: nothing is accepted for it"),
+        (false, true) => format!("project {name} (default)"),
+        (false, false) => format!("project {name}"),
+    })
+}
+
 fn whoami(status: u16, body: Value) -> Check {
     let code = body
         .pointer("/error/code")
@@ -244,7 +284,10 @@ fn whoami(status: u16, body: Value) -> Check {
             return check(
                 "whoami",
                 State::Fail,
-                format!("the API refused the key (HTTP {status} {code}); it is revoked, expired or lacks the read scope"),
+                format!(
+                    "the API refused the key (HTTP {status} {code}): {}",
+                    refusal_reason(&body)
+                ),
             )
         }
         404 => {
@@ -267,8 +310,11 @@ fn whoami(status: u16, body: Value) -> Check {
         "{} key",
         text(body.get("key_type")).unwrap_or("unknown")
     )];
+    let archived = body.pointer("/project/archived").and_then(Value::as_bool) == Some(true);
     for field in ["organization", "project", "plan"] {
-        if let Some(value) = text(body.get(field)) {
+        if field == "project" {
+            parts.extend(project(&body, archived));
+        } else if let Some(value) = text(body.get(field)) {
             parts.push(format!("{field} {value}"));
         }
     }
@@ -301,12 +347,15 @@ fn whoami(status: u16, body: Value) -> Check {
         }
     }
 
-    let state = if exhausted.is_empty() {
+    let mut state = if exhausted.is_empty() {
         State::Ok
     } else {
         parts.push(format!("exhausted: {}", exhausted.join(", ")));
         State::Warn
     };
+    if archived {
+        state = State::Fail;
+    }
     Check {
         name: "whoami",
         state,
@@ -501,6 +550,88 @@ mod tests {
             whoami.detail
         );
         assert_eq!(find(&checks, "network").state, State::Ok);
+    }
+
+    #[test]
+    fn a_refused_key_prints_the_reason_the_api_gave() {
+        let reason = |status: u16, body: &'static str| {
+            let (checks, _) = diagnose_against(status, body);
+            let whoami = find(&checks, "whoami");
+            assert_eq!(whoami.state, State::Fail);
+
+            whoami.detail.clone()
+        };
+
+        let revoked = reason(
+            401,
+            r#"{"error":{"code":"unauthorized","details":{"reason":"revoked"}}}"#,
+        );
+        let unknown = reason(
+            401,
+            r#"{"error":{"code":"unauthorized","details":{"reason":"unknown"}}}"#,
+        );
+        let malformed = reason(
+            401,
+            r#"{"error":{"code":"unauthorized","details":{"reason":"malformed"}}}"#,
+        );
+        let scope = reason(
+            403,
+            r#"{"error":{"code":"forbidden","details":{"scope":"verify"}}}"#,
+        );
+        let archived = reason(
+            403,
+            r#"{"error":{"code":"project_archived","details":{"project_id":"p","name":"Old site"}}}"#,
+        );
+        let silent = reason(401, r#"{"error":{"code":"unauthorized"}}"#);
+
+        assert!(revoked.ends_with("(HTTP 401 unauthorized): the key is revoked; create a new one"));
+        assert!(unknown.contains("no such key"), "{unknown}");
+        assert!(malformed.ends_with("the key is malformed"), "{malformed}");
+        assert!(scope.ends_with("(HTTP 403 forbidden): the key lacks the verify scope"));
+        assert!(
+            archived.contains("project Old site is archived"),
+            "{archived}"
+        );
+        assert!(silent.ends_with("the API gave no reason"), "{silent}");
+        assert!(!revoked.contains("expired or lacks"));
+    }
+
+    #[test]
+    fn the_resolved_project_is_printed_with_its_fallback_and_an_archived_one_fails() {
+        let scoped = whoami(
+            200,
+            serde_json::json!({
+                "key_type": "live",
+                "project": {"id": "p1", "name": "Storefront", "archived": false},
+                "resolved_project": {"id": "p1", "name": "Storefront", "default": false}
+            }),
+        );
+        let fallback = whoami(
+            200,
+            serde_json::json!({
+                "key_type": "live",
+                "resolved_project": {"id": "p0", "name": "Default", "default": true}
+            }),
+        );
+        let archived = whoami(
+            200,
+            serde_json::json!({
+                "key_type": "live",
+                "project": {"id": "p1", "name": "Old site", "archived": true},
+                "resolved_project": {"id": "p1", "name": "Old site", "default": false}
+            }),
+        );
+        let older = whoami(
+            200,
+            serde_json::json!({"key_type": "live", "project": "web"}),
+        );
+
+        assert_eq!(scoped.state, State::Ok);
+        assert_eq!(scoped.detail, "live key, project Storefront");
+        assert_eq!(fallback.detail, "live key, project Default (default)");
+        assert_eq!(archived.state, State::Fail);
+        assert!(archived.detail.contains("project Old site is archived"));
+        assert_eq!(older.detail, "live key, project web");
     }
 
     #[test]

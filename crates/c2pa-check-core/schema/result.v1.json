@@ -85,7 +85,33 @@
         "properties": {
           "title": { "type": "string" },
           "relationship": { "type": "string" },
-          "credential_status": { "$ref": "#/$defs/credentialStatus" }
+          "credential_status": { "$ref": "#/$defs/credentialStatus" },
+          "signer_name": {
+            "description": "Organization, else common name, of the certificate that signed the ingredient's manifest. Absent when the manifest is not in the store.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "origin": {
+      "description": "Whether the chain of validated ingredients reaches a signer on the selected trust list. It never changes credential.status. Absent in documents produced before the field existed.",
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "description": "none: the file's own credential is not valid. traced: it is valid and it, or a manifest reached through validated parentOf or componentOf ingredients (depth 8, 512 manifests), is signed by a listed signer. untraced: valid, no listed signer reached.",
+          "enum": ["traced", "untraced", "none"]
+        },
+        "signer_name": { "description": "The nearest listed signer. Only when traced.", "type": "string" },
+        "relationship": {
+          "description": "Relationship of the ingredient that points at the listed signer's manifest. Only when traced at depth 1 or more.",
+          "type": "string"
+        },
+        "depth": {
+          "description": "Ingredient hops to the listed signer; 0 when the file's own signer is listed. Only when traced.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8
         }
       }
     },

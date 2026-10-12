@@ -31,20 +31,14 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-pub fn scoped(mut body: Value) -> Value {
-    if body.get("project_id").is_none() {
-        if let Some(project) = env::value("C2PA_PROJECT_ID") {
-            body["project_id"] = Value::String(project);
-        }
-    }
-    body
-}
-
 pub struct Api {
     base: String,
     key: String,
     agent: ureq::Agent,
     sleep: fn(Duration),
+    project_env: Option<String>,
+    project_name: Option<String>,
+    project: std::sync::OnceLock<Option<String>>,
 }
 
 impl Api {
@@ -68,7 +62,57 @@ impl Api {
                 .build()
                 .into(),
             sleep: std::thread::sleep,
+            project_env: env::value("C2PA_PROJECT_ID"),
+            project_name: None,
+            project: std::sync::OnceLock::new(),
         }
+    }
+
+    pub fn with_project(mut self, name: Option<String>) -> Self {
+        self.project_name = name;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_project_id(mut self, id: Option<&str>) -> Self {
+        self.project_env = id.map(str::to_string);
+        self
+    }
+
+    pub fn project_id(&self) -> Result<Option<&str>, ApiError> {
+        if let Some(resolved) = self.project.get() {
+            return Ok(resolved.as_deref());
+        }
+        let resolved = match (&self.project_env, &self.project_name) {
+            (Some(id), _) => Some(id.clone()),
+            (None, Some(name)) => {
+                let project = self.call(
+                    "PUT",
+                    "/projects",
+                    Some(&serde_json::json!({ "name": name })),
+                )?;
+                let id = project["id"].as_str().ok_or_else(|| ApiError {
+                    status: 200,
+                    code: String::new(),
+                    detail: format!("PUT /projects returned no id for {name}"),
+                })?;
+
+                Some(id.to_string())
+            }
+            (None, None) => None,
+        };
+
+        Ok(self.project.get_or_init(|| resolved).as_deref())
+    }
+
+    pub fn scoped(&self, mut body: Value) -> Result<Value, ApiError> {
+        if body.get("project_id").is_none() {
+            if let Some(project) = self.project_id()? {
+                body["project_id"] = Value::String(project.to_string());
+            }
+        }
+
+        Ok(body)
     }
 
     #[cfg(test)]
@@ -257,6 +301,64 @@ mod tests {
             (err.status, err.code.as_str()),
             (402, "usage_limit_exceeded")
         );
+    }
+
+    #[test]
+    fn the_project_is_the_environment_id_else_the_named_one_resolved_once_else_nothing() {
+        let (base, server) = serve(1, |request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body, serde_json::json!({"name": "Storefront"}));
+            (201, r#"{"id":"p-named","name":"Storefront"}"#.to_string())
+        });
+        let named = Api::new(base, "k".into())
+            .without_waiting()
+            .with_project_id(None)
+            .with_project(Some("Storefront".into()));
+        let from_env = Api::new("http://127.0.0.1:9/v1".into(), "k".into())
+            .without_waiting()
+            .with_project_id(Some("p-env"))
+            .with_project(Some("Storefront".into()));
+        let unset = Api::new("http://127.0.0.1:9/v1".into(), "k".into())
+            .without_waiting()
+            .with_project_id(None);
+
+        let first = named.scoped(serde_json::json!({"hashes": []})).unwrap();
+        let second = named.scoped(serde_json::json!({})).unwrap();
+        let explicit = named
+            .scoped(serde_json::json!({"project_id": "p-own"}))
+            .unwrap();
+
+        assert_eq!(server.join().unwrap(), ["/v1/projects"]);
+        assert_eq!(first["project_id"], "p-named");
+        assert_eq!(second["project_id"], "p-named");
+        assert_eq!(explicit["project_id"], "p-own");
+        assert_eq!(from_env.project_id().unwrap(), Some("p-env"));
+        assert_eq!(unset.project_id().unwrap(), None);
+        assert!(unset
+            .scoped(serde_json::json!({}))
+            .unwrap()
+            .get("project_id")
+            .is_none());
+    }
+
+    #[test]
+    fn a_refused_project_is_an_error_not_a_silent_default() {
+        let (base, server) = serve(1, |_| {
+            (
+                409,
+                r#"{"error":{"code":"project_archived","message":"archived","retryable":false}}"#
+                    .to_string(),
+            )
+        });
+        let api = Api::new(base, "k".into())
+            .without_waiting()
+            .with_project_id(None)
+            .with_project(Some("Old".into()));
+
+        let err = api.scoped(serde_json::json!({})).unwrap_err();
+
+        assert_eq!(server.join().unwrap(), ["/v1/projects"]);
+        assert_eq!((err.status, err.code.as_str()), (409, "project_archived"));
     }
 
     #[test]

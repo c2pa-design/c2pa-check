@@ -69,6 +69,15 @@ struct Cli {
 
     #[arg(
         long,
+        value_enum,
+        value_name = "METRIC",
+        help = "what --coverage counts: trusted (signer on the trust list, the default), traced \
+(valid, and the chain of ingredients reaches a signer on the trust list) or valid (any intact credential)"
+    )]
+    coverage_metric: Option<Metric>,
+
+    #[arg(
+        long,
         value_name = "PATH",
         help = "fail when a file that had a valid credential in this baseline has lost it"
     )]
@@ -232,6 +241,53 @@ pub enum Expect {
     Absent,
 }
 
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Metric {
+    #[default]
+    Trusted,
+    Traced,
+    Valid,
+}
+
+impl Metric {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Traced => "traced",
+            Self::Valid => "valid",
+        }
+    }
+
+    pub fn counts(self, report: &Report) -> bool {
+        use c2pa_check_core::{CredentialStatus as S, OriginStatus};
+
+        match self {
+            Self::Trusted => report.credential.status == S::ValidTrusted,
+            Self::Traced => report.origin.status == OriginStatus::Traced,
+            Self::Valid => matches!(
+                report.credential.status,
+                S::ValidTrusted | S::ValidUntrusted
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Gate {
+    pub metric: Metric,
+    pub expected: bool,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            metric: Metric::default(),
+            expected: true,
+        }
+    }
+}
+
 fn command_name(command: Option<&Command>) -> &'static str {
     match command {
         None => "check",
@@ -288,8 +344,9 @@ fn run(mut cli: Cli) -> anyhow::Result<u8> {
         Some(Command::Carry(args)) => {
             let bundle = load_bundle(&cli)?;
             let verifier = verifier_for(&bundle, cli.trust.into())?;
+            let project = config::project(cli.config.as_deref())?;
 
-            return carry_cmd::run(args, &verifier);
+            return carry_cmd::run(args, &verifier, project);
         }
         Some(Command::Login(args)) => return login::run(&args),
         Some(Command::ReportSend { body }) => {
@@ -320,7 +377,7 @@ fn run(mut cli: Cli) -> anyhow::Result<u8> {
                 set.baseline = None;
             }
             let checked = check(&cli, &sets)?;
-            let registered = register(&checked.results)?;
+            let registered = register(&cli, &checked)?;
 
             return Ok(checked.read_failure().unwrap_or(registered));
         }
@@ -332,13 +389,13 @@ fn run(mut cli: Cli) -> anyhow::Result<u8> {
     let checked = check(&cli, &sets)?;
 
     for (format, path) in reports {
-        write_report(format, &checked.results, path)?;
+        write_report(format, &checked.results, &checked.gates, path)?;
     }
     for failure in &checked.failures {
         eprintln!("c2pa-check: {failure}");
     }
     let registered = if cli.register {
-        register(&checked.results)?
+        register(&cli, &checked)?
     } else {
         0
     };
@@ -358,12 +415,14 @@ struct Set {
     targets: Vec<String>,
     expect: Option<Expect>,
     coverage: Option<f64>,
+    gate: Gate,
     baseline: Option<PathBuf>,
     git_tracked: bool,
 }
 
 struct Checked {
     results: Vec<(String, Option<Report>)>,
+    gates: Vec<Gate>,
     failures: Vec<String>,
     network_failure: bool,
     parse_failure: bool,
@@ -386,6 +445,10 @@ fn sets(cli: &Cli) -> anyhow::Result<Vec<Set>> {
             targets: cli.targets.clone(),
             expect: cli.expect,
             coverage: cli.coverage,
+            gate: Gate {
+                metric: cli.coverage_metric.unwrap_or_default(),
+                expected: cli.expect != Some(Expect::Absent),
+            },
             baseline: cli.baseline.clone(),
             git_tracked: cli.git_tracked,
         }]);
@@ -408,6 +471,13 @@ fn sets(cli: &Cli) -> anyhow::Result<Vec<Set>> {
             targets: c.paths,
             expect: c.expect,
             coverage: c.coverage,
+            gate: Gate {
+                metric: cli
+                    .coverage_metric
+                    .or(c.coverage_metric)
+                    .unwrap_or_default(),
+                expected: c.expect != Some(Expect::Absent),
+            },
             baseline: c.baseline,
             git_tracked: c.git_tracked || cli.git_tracked,
         })
@@ -466,6 +536,7 @@ fn check(cli: &Cli, sets: &[Set]) -> anyhow::Result<Checked> {
 
     let mut checked = Checked {
         results: Vec::new(),
+        gates: Vec::new(),
         failures: Vec::new(),
         network_failure: false,
         parse_failure: false,
@@ -505,13 +576,14 @@ fn check(cli: &Cli, sets: &[Set]) -> anyhow::Result<Checked> {
             }
         }
 
+        checked.gates.resize(checked.results.len(), set.gate);
         let results = &checked.results[first..];
         let label = if set.name.is_empty() {
             String::new()
         } else {
             format!("{}: ", set.name)
         };
-        let mut failures: Vec<String> = judge(results, set.expect, set.coverage)
+        let mut failures: Vec<String> = judge(results, set.expect, set.coverage, set.gate)
             .into_iter()
             .map(|failure| format!("{label}{failure}"))
             .collect();
@@ -544,12 +616,19 @@ Run `c2pa-check login` or create a key at https://app.c2pa.design."
     true
 }
 
-fn register(results: &[(String, Option<Report>)]) -> anyhow::Result<u8> {
+fn register(cli: &Cli, checked: &Checked) -> anyhow::Result<u8> {
     if skipped_without_key(env::api_key().as_deref(), "register") {
         return Ok(0);
     }
-    let api = api::Api::from_env()?;
-    match register::run(&api, results) {
+    let api = api::Api::from_env()?.with_project(config::project(cli.config.as_deref())?);
+    let unexpected = checked
+        .gates
+        .iter()
+        .enumerate()
+        .filter(|(_, gate)| !gate.expected)
+        .map(|(index, _)| index)
+        .collect();
+    match register::run(&api, &checked.results, &unexpected) {
         Ok(done) => {
             eprintln!(
                 "c2pa-check: {} distinct files, {} newly registered",
@@ -570,12 +649,14 @@ fn register(results: &[(String, Option<Report>)]) -> anyhow::Result<u8> {
 fn write_report(
     format: Format,
     results: &[(String, Option<Report>)],
+    gates: &[Gate],
     path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let Some(path) = path else {
         return output::render(
             format,
             results,
+            gates,
             std::io::stdout().is_terminal(),
             &mut std::io::stdout().lock(),
         );
@@ -583,7 +664,7 @@ fn write_report(
     let file = std::fs::File::create(path)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
     let mut writer = std::io::BufWriter::new(file);
-    output::render(format, results, false, &mut writer)?;
+    output::render(format, results, gates, false, &mut writer)?;
     std::io::Write::flush(&mut writer)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))
 }
@@ -705,6 +786,7 @@ fn judge(
     results: &[(String, Option<Report>)],
     expect: Option<Expect>,
     coverage: Option<f64>,
+    gate: Gate,
 ) -> Vec<String> {
     use c2pa_check_core::CredentialStatus as S;
 
@@ -730,23 +812,20 @@ fn judge(
     }
 
     if let Some(threshold) = coverage {
-        let total = results.len();
-        let trusted = results
+        let total = if gate.expected { results.len() } else { 0 };
+        let counted = results
             .iter()
-            .filter(|(_, report)| {
-                report
-                    .as_ref()
-                    .is_some_and(|r| r.credential.status == S::ValidTrusted)
-            })
+            .filter(|(_, report)| report.as_ref().is_some_and(|r| gate.metric.counts(r)))
             .count();
         let pct = if total == 0 {
             100.0
         } else {
-            trusted as f64 / total as f64 * 100.0
+            counted as f64 / total as f64 * 100.0
         };
         if pct + f64::EPSILON < threshold {
             failures.push(format!(
-                "coverage {pct:.1}% ({trusted} of {total} trusted) is below {threshold}"
+                "coverage {pct:.1}% ({counted} of {total} {}) is below {threshold}",
+                gate.metric.as_str()
             ));
         }
     }
@@ -794,7 +873,7 @@ mod tests {
         expect: Option<Expect>,
         coverage: Option<f64>,
     ) -> bool {
-        judge(results, expect, coverage).is_empty()
+        judge(results, expect, coverage, Gate::default()).is_empty()
     }
 
     #[test]
@@ -817,6 +896,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].targets, ["a.png", "b.png"]);
         assert_eq!(got[0].coverage, Some(80.0));
+        assert_eq!(got[0].gate, Gate::default());
         assert_eq!(got[0].expect, Some(Expect::Trusted));
         assert_eq!(got[0].baseline.as_deref(), Some(Path::new("base.json")));
         assert!(got[0].git_tracked && got[0].name.is_empty());
@@ -830,7 +910,8 @@ mod tests {
         std::fs::write(
             &full,
             r#"{"checks":[{"name":"shipped","paths":["public/*.webp"],"baseline":"b.json"},
-                          {"name":"sources","paths":["design/*.png"],"coverage":39}]}"#,
+                          {"name":"sources","paths":["design/*.png"],"coverage":39,"coverage_metric":"traced"},
+                          {"name":"icons","paths":["icons/*.svg"],"expect":"absent"}]}"#,
         )
         .unwrap();
         std::fs::write(&empty, r#"{"domains":["example.com"]}"#).unwrap();
@@ -839,9 +920,21 @@ mod tests {
 
         let got = sets(&with(&full)).unwrap();
         let none = sets(&with(&empty));
+        let flagged = sets(&Cli::parse_from([
+            "c2pa-check",
+            "--config",
+            &full.to_string_lossy(),
+            "--coverage-metric",
+            "valid",
+        ]))
+        .unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].gate, Gate::default());
+        assert_eq!(got[1].gate.metric, Metric::Traced);
+        assert!(got[1].gate.expected && !got[2].gate.expected);
+        assert!(flagged.iter().all(|set| set.gate.metric == Metric::Valid));
         assert_eq!((got[0].name.as_str(), got[0].coverage), ("shipped", None));
         assert_eq!(
             (got[1].name.as_str(), got[1].coverage),
@@ -927,7 +1020,7 @@ mod tests {
     fn a_failed_gate_says_which_number_missed() {
         let set = results(&[CredentialStatus::ValidTrusted, CredentialStatus::Absent]);
 
-        let got = judge(&set, Some(Expect::Trusted), Some(80.0));
+        let got = judge(&set, Some(Expect::Trusted), Some(80.0), Gate::default());
 
         assert_eq!(
             got,
@@ -1003,6 +1096,62 @@ mod tests {
         assert!(!meets_expectations(&set, None, Some(100.0)));
     }
 
+    fn traced(
+        mut results: Vec<(String, Option<Report>)>,
+        indexes: &[usize],
+    ) -> Vec<(String, Option<Report>)> {
+        for index in indexes {
+            results[*index].1.as_mut().unwrap().origin.status =
+                c2pa_check_core::OriginStatus::Traced;
+        }
+
+        results
+    }
+
+    #[test]
+    fn the_gate_counts_what_its_metric_names_and_says_so() {
+        let set = traced(
+            results(&[
+                CredentialStatus::ValidTrusted,
+                CredentialStatus::ValidUntrusted,
+                CredentialStatus::ValidUntrusted,
+                CredentialStatus::Absent,
+            ]),
+            &[0, 1],
+        );
+        let gate = |metric| Gate {
+            metric,
+            expected: true,
+        };
+
+        assert_eq!(
+            judge(&set, None, Some(60.0), gate(Metric::Trusted)),
+            ["coverage 25.0% (1 of 4 trusted) is below 60"]
+        );
+        assert_eq!(
+            judge(&set, None, Some(60.0), gate(Metric::Traced)),
+            ["coverage 50.0% (2 of 4 traced) is below 60"]
+        );
+        assert!(judge(&set, None, Some(50.0), gate(Metric::Traced)).is_empty());
+        assert!(judge(&set, None, Some(75.0), gate(Metric::Valid)).is_empty());
+        assert_eq!(
+            judge(&set, None, Some(80.0), gate(Metric::Valid)),
+            ["coverage 75.0% (3 of 4 valid) is below 80"]
+        );
+    }
+
+    #[test]
+    fn files_of_a_check_that_expects_no_credential_are_outside_the_denominator() {
+        let set = results(&[CredentialStatus::Absent, CredentialStatus::Absent]);
+        let gate = Gate {
+            metric: Metric::Trusted,
+            expected: false,
+        };
+
+        assert!(judge(&set, Some(Expect::Absent), Some(100.0), gate).is_empty());
+        assert!(!judge(&set, None, Some(100.0), Gate::default()).is_empty());
+    }
+
     #[test]
     fn a_url_is_never_treated_as_a_glob() {
         assert!(is_url("https://example.com/a.jpg"));
@@ -1054,12 +1203,14 @@ mod tests {
         write_report(
             Format::Json,
             &results(&[CredentialStatus::Absent]),
+            &[Gate::default()],
             Some(&json),
         )
         .unwrap();
         write_report(
             Format::Junit,
             &results(&[CredentialStatus::Absent]),
+            &[Gate::default()],
             Some(&junit),
         )
         .unwrap();
@@ -1068,6 +1219,7 @@ mod tests {
         let missing = write_report(
             Format::Json,
             &results(&[CredentialStatus::Absent]),
+            &[Gate::default()],
             Some(&dir.join("no-such-dir").join("r.json")),
         );
         std::fs::remove_dir_all(&dir).ok();

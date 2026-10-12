@@ -2,11 +2,14 @@ use std::io::Write;
 
 use c2pa_check_core::{CredentialStatus, Report, SourceCategory};
 
-use crate::Format;
+use crate::{Format, Gate};
+
+const MIXED_METRICS: &str = "mixed";
 
 pub fn render(
     format: Format,
     results: &[(String, Option<Report>)],
+    gates: &[Gate],
     color: bool,
     mut out: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -16,30 +19,62 @@ pub fn render(
                 text(&mut out, target, report.as_ref(), color)?;
             }
             if results.len() > 1 {
-                summary(&mut out, results)?;
+                summary(&mut out, results, gates)?;
             }
         }
         Format::Json => {
-            let documents: Vec<_> = results
-                .iter()
-                .map(|(target, report)| serde_json::json!({ "target": target, "result": report }))
+            let documents: Vec<_> = (0..results.len())
+                .map(|index| document(results, gates, index))
                 .collect();
             serde_json::to_writer_pretty(&mut out, &documents)?;
             writeln!(out)?;
         }
         Format::Ndjson => {
-            for (target, report) in results {
-                serde_json::to_writer(
-                    &mut out,
-                    &serde_json::json!({ "target": target, "result": report }),
-                )?;
+            for index in 0..results.len() {
+                serde_json::to_writer(&mut out, &document(results, gates, index))?;
                 writeln!(out)?;
             }
         }
-        Format::Junit => junit(&mut out, results)?,
+        Format::Junit => junit(&mut out, results, gates)?,
     }
 
     Ok(())
+}
+
+fn gate(gates: &[Gate], index: usize) -> Gate {
+    gates.get(index).copied().unwrap_or_default()
+}
+
+fn covered(gate: Gate, report: Option<&Report>) -> bool {
+    report.is_some_and(|r| gate.metric.counts(r))
+}
+
+fn document(
+    results: &[(String, Option<Report>)],
+    gates: &[Gate],
+    index: usize,
+) -> serde_json::Value {
+    let (target, report) = &results[index];
+    let gate = gate(gates, index);
+
+    serde_json::json!({
+        "target": target,
+        "result": report,
+        "coverage": {
+            "metric": gate.metric.as_str(),
+            "expected": gate.expected,
+            "covered": gate.expected && covered(gate, report.as_ref()),
+        },
+    })
+}
+
+fn metric_label(gates: &[Gate], count: usize) -> &'static str {
+    let first = gate(gates, 0).metric;
+    if (1..count).all(|index| gate(gates, index).metric == first) {
+        first.as_str()
+    } else {
+        MIXED_METRICS
+    }
 }
 
 const RESET: &str = "\x1b[0m";
@@ -118,6 +153,15 @@ fn text(
             let issuer = signer.issuer.as_deref().unwrap_or("unknown issuer");
             writeln!(out, "  Signer                {name} · {issuer}")?;
         }
+        if let (Some(depth), Some(name)) = (
+            report.origin.depth.filter(|depth| *depth > 0),
+            report.origin.signer_name.as_deref(),
+        ) {
+            writeln!(
+                out,
+                "  Origin                TRACED to {name}, {depth} ingredient step(s) back"
+            )?;
+        }
     }
 
     writeln!(
@@ -147,24 +191,27 @@ fn text(
     Ok(())
 }
 
-fn coverage(results: &[(String, Option<Report>)]) -> f64 {
-    if results.is_empty() {
+fn coverage(results: &[(String, Option<Report>)], gates: &[Gate]) -> f64 {
+    let expected: Vec<usize> = (0..results.len())
+        .filter(|index| gate(gates, *index).expected)
+        .collect();
+    if expected.is_empty() {
         return 0.0;
     }
 
-    let trusted = results
+    let counted = expected
         .iter()
-        .filter(|(_, report)| {
-            report
-                .as_ref()
-                .is_some_and(|r| r.credential.status == CredentialStatus::ValidTrusted)
-        })
+        .filter(|index| covered(gate(gates, **index), results[**index].1.as_ref()))
         .count();
 
-    trusted as f64 / results.len() as f64 * 100.0
+    counted as f64 / expected.len() as f64 * 100.0
 }
 
-fn summary(out: &mut impl Write, results: &[(String, Option<Report>)]) -> anyhow::Result<()> {
+fn summary(
+    out: &mut impl Write,
+    results: &[(String, Option<Report>)],
+    gates: &[Gate],
+) -> anyhow::Result<()> {
     let total = results.len();
     let trusted = results
         .iter()
@@ -175,11 +222,13 @@ fn summary(out: &mut impl Write, results: &[(String, Option<Report>)]) -> anyhow
         .count();
     let missing: Vec<_> = results
         .iter()
-        .filter(|(_, r)| {
-            r.as_ref()
-                .is_some_and(|r| r.credential.status == CredentialStatus::Absent)
+        .enumerate()
+        .filter(|(index, (_, r))| {
+            gate(gates, *index).expected
+                && r.as_ref()
+                    .is_some_and(|r| r.credential.status == CredentialStatus::Absent)
         })
-        .map(|(target, _)| target.as_str())
+        .map(|(_, (target, _))| target.as_str())
         .collect();
 
     writeln!(
@@ -195,20 +244,28 @@ fn summary(out: &mut impl Write, results: &[(String, Option<Report>)]) -> anyhow
     }
     writeln!(
         out,
-        "coverage {:.1}%   monitor production provenance at https://c2pa.design",
-        coverage(results)
+        "coverage {:.1}% {}   monitor production provenance at https://c2pa.design",
+        coverage(results, gates),
+        metric_label(gates, results.len())
     )?;
 
     Ok(())
 }
 
-fn junit(out: &mut impl Write, results: &[(String, Option<Report>)]) -> anyhow::Result<()> {
+fn junit(
+    out: &mut impl Write,
+    results: &[(String, Option<Report>)],
+    gates: &[Gate],
+) -> anyhow::Result<()> {
+    let passes = |index: usize, report: &Report| {
+        let gate = gate(gates, index);
+
+        !gate.expected || gate.metric.counts(report)
+    };
     let failures = results
         .iter()
-        .filter(|(_, r)| {
-            r.as_ref()
-                .is_none_or(|r| r.credential.status != CredentialStatus::ValidTrusted)
-        })
+        .enumerate()
+        .filter(|(index, (_, r))| r.as_ref().is_some_and(|r| !passes(*index, r)))
         .count();
 
     writeln!(out, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
@@ -218,19 +275,33 @@ fn junit(out: &mut impl Write, results: &[(String, Option<Report>)]) -> anyhow::
         results.len(),
         failures
     )?;
-    for (target, report) in results {
+    writeln!(out, "  <properties>")?;
+    writeln!(
+        out,
+        r#"    <property name="coverage_metric" value="{}"/>"#,
+        metric_label(gates, results.len())
+    )?;
+    writeln!(
+        out,
+        r#"    <property name="coverage" value="{:.1}"/>"#,
+        coverage(results, gates)
+    )?;
+    writeln!(out, "  </properties>")?;
+    for (index, (target, report)) in results.iter().enumerate() {
         let name = escape(target);
         match report {
-            Some(r) if r.credential.status == CredentialStatus::ValidTrusted => {
+            Some(r) if passes(index, r) => {
                 writeln!(out, r#"  <testcase name="{name}"/>"#)?;
             }
             Some(r) => {
                 writeln!(out, r#"  <testcase name="{name}">"#)?;
                 writeln!(
                     out,
-                    r#"    <failure message="{}">credential.status is {}</failure>"#,
+                    r#"    <failure message="{}">credential.status is {}, origin.status is {}; not {}</failure>"#,
                     escape(r.credential.status.as_str()),
-                    escape(r.credential.status.as_str())
+                    escape(r.credential.status.as_str()),
+                    r.origin.status.as_str(),
+                    gate(gates, index).metric.as_str()
                 )?;
                 writeln!(out, "  </testcase>")?;
             }
@@ -322,6 +393,7 @@ pub fn completions(shell: clap_complete::Shell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Metric;
     use c2pa_check_core::report::{Asset, Credential, EngineInfo};
 
     fn report(status: CredentialStatus) -> Report {
@@ -444,28 +516,110 @@ mod tests {
     }
 
     #[test]
+    fn a_traced_file_names_the_origin_signer_and_is_never_called_trusted() {
+        let mut carried = report(CredentialStatus::ValidUntrusted);
+        carried.origin = c2pa_check_core::Origin {
+            status: c2pa_check_core::OriginStatus::Traced,
+            signer_name: Some("OpenAI".into()),
+            relationship: Some("parentOf".into()),
+            depth: Some(1),
+        };
+
+        let out = rendered(|out| text(out, "a.webp", Some(&carried), false));
+
+        assert!(out.contains("Origin                TRACED to OpenAI, 1 ingredient step(s) back"));
+        assert!(out.contains("NOT ON THE TRUST LIST"));
+        assert!(!out.contains("TRUSTED ("));
+    }
+
+    #[test]
     fn coverage_is_the_share_of_trusted_files() {
-        assert_eq!(coverage(&results(&[CredentialStatus::ValidTrusted])), 100.0);
         assert_eq!(
-            coverage(&results(&[
-                CredentialStatus::ValidTrusted,
-                CredentialStatus::Absent
-            ])),
+            coverage(&results(&[CredentialStatus::ValidTrusted]), &[]),
+            100.0
+        );
+        assert_eq!(
+            coverage(
+                &results(&[CredentialStatus::ValidTrusted, CredentialStatus::Absent]),
+                &[]
+            ),
             50.0
         );
     }
 
     #[test]
     fn coverage_of_nothing_is_zero_rather_than_a_division_by_zero() {
-        assert_eq!(coverage(&[]), 0.0);
-        assert!(coverage(&[]).is_finite());
+        assert_eq!(coverage(&[], &[]), 0.0);
+        assert!(coverage(&[], &[]).is_finite());
+    }
+
+    fn gates(metric: Metric, expected: &[bool]) -> Vec<Gate> {
+        expected
+            .iter()
+            .map(|expected| Gate {
+                metric,
+                expected: *expected,
+            })
+            .collect()
+    }
+
+    fn carried_and_drawn() -> Vec<(String, Option<Report>)> {
+        let mut set = results(&[
+            CredentialStatus::ValidUntrusted,
+            CredentialStatus::ValidUntrusted,
+            CredentialStatus::Absent,
+        ]);
+        set[0].1.as_mut().unwrap().origin.status = c2pa_check_core::OriginStatus::Traced;
+
+        set
+    }
+
+    #[test]
+    fn every_report_names_the_metric_beside_the_share_and_leaves_unexpected_files_out() {
+        let set = carried_and_drawn();
+        let traced = gates(Metric::Traced, &[true, true, false]);
+
+        let text = rendered(|out| summary(out, &set, &traced));
+        let xml = rendered(|out| junit(out, &set, &traced));
+        let json = rendered(|out| render(Format::Json, &set, &traced, false, out));
+        let ndjson = rendered(|out| render(Format::Ndjson, &set, &traced, false, out));
+        let default = rendered(|out| summary(out, &set, &[]));
+        let mixed = rendered(|out| {
+            let mut two = traced.clone();
+            two[1].metric = Metric::Valid;
+            summary(out, &set, &two)
+        });
+
+        assert!(text.contains("coverage 50.0% traced"), "{text}");
+        assert!(!text.contains("missing: f2.jpg"), "{text}");
+        assert!(default.contains("coverage 0.0% trusted"), "{default}");
+        assert!(default.contains("missing: f2.jpg"));
+        assert!(mixed.contains("coverage 100.0% mixed"), "{mixed}");
+        assert!(xml.contains(r#"<property name="coverage_metric" value="traced"/>"#));
+        assert!(xml.contains(r#"<property name="coverage" value="50.0"/>"#));
+        assert!(xml.contains(r#"tests="3" failures="1""#), "{xml}");
+        assert!(xml.contains("origin.status is none; not traced"), "{xml}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed[0]["coverage"],
+            serde_json::json!({"metric": "traced", "expected": true, "covered": true})
+        );
+        assert_eq!(parsed[1]["coverage"]["covered"], false);
+        assert_eq!(
+            parsed[2]["coverage"],
+            serde_json::json!({"metric": "traced", "expected": false, "covered": false})
+        );
+        assert_eq!(ndjson.lines().count(), 3);
+        assert!(ndjson
+            .lines()
+            .all(|line| line.contains(r#""metric":"traced""#)));
     }
 
     #[test]
     fn the_summary_lists_missing_files_up_to_a_cap() {
         let many = results(&[CredentialStatus::Absent; MAX_LISTED_MISSING + 5]);
 
-        let out = rendered(|out| summary(out, &many));
+        let out = rendered(|out| summary(out, &many, &[]));
 
         assert_eq!(out.matches("  missing: ").count(), MAX_LISTED_MISSING);
         assert!(out.contains("… and 5 more"));
@@ -479,9 +633,10 @@ mod tests {
             CredentialStatus::Absent,
         ]);
 
-        let out = rendered(|out| junit(out, &set));
+        let out = rendered(|out| junit(out, &set, &[]));
 
         assert!(out.contains(r#"tests="3" failures="2""#));
+        assert!(out.contains(r#"<property name="coverage_metric" value="trusted"/>"#));
         assert_eq!(out.matches("<failure").count(), 2);
     }
 
@@ -489,7 +644,7 @@ mod tests {
     fn junit_reports_an_unreadable_target_as_an_error_not_a_failure() {
         let set = vec![("broken.jpg".to_string(), None)];
 
-        let out = rendered(|out| junit(out, &set));
+        let out = rendered(|out| junit(out, &set, &[]));
 
         assert!(out.contains("<error message=\"unreadable\"/>"));
         assert!(!out.contains("<failure"));
@@ -499,7 +654,7 @@ mod tests {
     fn junit_escapes_a_name_that_would_otherwise_break_the_document() {
         let set = vec![(r#"a&b<c>"d".jpg"#.to_string(), None)];
 
-        let out = rendered(|out| junit(out, &set));
+        let out = rendered(|out| junit(out, &set, &[]));
 
         assert!(out.contains("a&amp;b&lt;c&gt;&quot;d&quot;.jpg"));
         assert!(!out.contains("<c>"));
@@ -516,15 +671,7 @@ mod tests {
     fn json_carries_the_target_beside_every_result() {
         let set = results(&[CredentialStatus::ValidTrusted]);
 
-        let out = rendered(|out| {
-            let documents: Vec<_> = set
-                .iter()
-                .map(|(target, report)| serde_json::json!({ "target": target, "result": report }))
-                .collect();
-            serde_json::to_writer(out, &documents)?;
-
-            Ok(())
-        });
+        let out = rendered(|out| render(Format::Json, &set, &[], false, out));
 
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("json output");
         assert_eq!(parsed[0]["target"], "f0.jpg");

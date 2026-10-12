@@ -5,8 +5,9 @@ use serde_json::Value;
 use crate::classify;
 use crate::explain;
 use crate::report::{
-    Action, Asset, Claim, Credential, CredentialStatus, EngineInfo, Ingredient, Report, Signer,
-    Source, SourceCategory, TrustSelector, Validation, ValidationEntry, SCHEMA_VERSION,
+    Action, Asset, Claim, Credential, CredentialStatus, EngineInfo, Ingredient, Origin,
+    OriginStatus, Report, Signer, Source, SourceCategory, TrustSelector, Validation,
+    ValidationEntry, SCHEMA_VERSION,
 };
 use crate::Options;
 
@@ -18,6 +19,9 @@ const MAX_SOURCE_MANIFESTS: usize = 512;
 const RELATION_PARENT: &str = "parentOf";
 const RELATION_COMPONENT: &str = "componentOf";
 const MAX_DISTINCT_CODES: usize = 256;
+const CODE_UNTRUSTED: &str = "signingCredential.untrusted";
+pub const TRUSTED_MANIFESTS: &str = "trusted_manifests";
+pub const MAX_TRUSTED_MANIFESTS: usize = MAX_SOURCE_MANIFESTS;
 
 pub fn build(
     store: Value,
@@ -41,7 +45,15 @@ pub fn build(
     let signer = signer(active, trusted, selector);
     let claim = claim(active);
     let (source, actions) = source_and_actions(&store, active);
-    let ingredients = ingredients(active, options.max_ingredients);
+    let trusted_manifests = trusted_manifests(&store);
+    let origin = origin(
+        &store,
+        active,
+        &credential,
+        signer.as_ref(),
+        &trusted_manifests,
+    );
+    let ingredients = ingredients(&store, active, options.max_ingredients, &trusted_manifests);
     let validation = validation_entries(&store);
 
     Report {
@@ -51,6 +63,7 @@ pub fn build(
         signer,
         claim,
         source,
+        origin,
         actions,
         ingredients,
         validation,
@@ -303,22 +316,173 @@ fn resolved_source(store: &Value, manifest: &Value, depth: usize, budget: &mut u
     source
 }
 
-fn ingredients(active: Option<&Value>, limit: usize) -> Vec<Ingredient> {
-    let Some(manifest) = active else {
-        return Vec::new();
-    };
+fn trusted_manifests(store: &Value) -> HashSet<&str> {
+    store
+        .get(TRUSTED_MANIFESTS)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect()
+}
 
+fn ingredient_items(manifest: &Value) -> &[Value] {
     manifest
         .get("ingredients")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
+}
+
+fn ingredient_manifest<'a>(store: &'a Value, item: &'a Value) -> Option<(&'a str, &'a Value)> {
+    let label = item.get("active_manifest").and_then(Value::as_str)?;
+
+    Some((label, store.get("manifests")?.get(label)?))
+}
+
+fn signer_name(manifest: &Value) -> Option<String> {
+    let info = manifest.get("signature_info")?;
+
+    text(info.get("issuer"))
+        .as_deref()
+        .map(organization_of)
+        .or_else(|| text(info.get("common_name")))
+}
+
+struct TrustedSigner {
+    depth: u32,
+    signer_name: Option<String>,
+    relationship: String,
+}
+
+fn nearer(a: Option<TrustedSigner>, b: Option<TrustedSigner>) -> Option<TrustedSigner> {
+    match (a, b) {
+        (Some(a), Some(b)) if b.depth < a.depth => Some(b),
+        (Some(a), _) => Some(a),
+        (None, b) => b,
+    }
+}
+
+fn nearest_trusted(
+    store: &Value,
+    manifest: &Value,
+    trusted: &HashSet<&str>,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<TrustedSigner> {
+    if depth == 0 {
+        return None;
+    }
+    let mut parent = None;
+    let mut component = None;
+    let mut component_invalid = false;
+
+    for item in ingredient_items(manifest) {
+        let relationship = item.get("relationship").and_then(Value::as_str);
+        let is_component = relationship == Some(RELATION_COMPONENT);
+        if !is_component && relationship != Some(RELATION_PARENT) {
+            continue;
+        }
+        let status = ingredient_status(item);
+        if status == Some(CredentialStatus::PresentInvalid) {
+            component_invalid |= is_component;
+            continue;
+        }
+        let Some((label, origin)) = ingredient_manifest(store, item)
+            .filter(|_| status == Some(CredentialStatus::ValidUntrusted) && *budget > 0)
+        else {
+            continue;
+        };
+        *budget -= 1;
+
+        let found = if trusted.contains(label) {
+            Some(TrustedSigner {
+                depth: 1,
+                signer_name: signer_name(origin),
+                relationship: relationship.unwrap_or_default().to_string(),
+            })
+        } else {
+            nearest_trusted(store, origin, trusted, depth - 1, budget).map(|hit| TrustedSigner {
+                depth: hit.depth + 1,
+                ..hit
+            })
+        };
+        if is_component {
+            component = nearer(component, found);
+        } else {
+            parent = nearer(parent, found);
+        }
+    }
+    if component_invalid {
+        component = None;
+    }
+
+    nearer(parent, component)
+}
+
+fn origin(
+    store: &Value,
+    active: Option<&Value>,
+    credential: &Credential,
+    signer: Option<&Signer>,
+    trusted: &HashSet<&str>,
+) -> Origin {
+    if !credential.valid {
+        return Origin::default();
+    }
+    if credential.trusted {
+        return Origin {
+            status: OriginStatus::Traced,
+            signer_name: signer
+                .and_then(|s| s.organization.clone().or_else(|| s.common_name.clone())),
+            relationship: None,
+            depth: Some(0),
+        };
+    }
+    let mut budget = MAX_SOURCE_MANIFESTS;
+
+    active
+        .and_then(|manifest| {
+            nearest_trusted(store, manifest, trusted, MAX_SOURCE_DEPTH, &mut budget)
+        })
+        .map_or_else(Origin::untraced, |hit| Origin {
+            status: OriginStatus::Traced,
+            signer_name: hit.signer_name,
+            relationship: Some(hit.relationship),
+            depth: Some(hit.depth),
+        })
+}
+
+fn ingredients(
+    store: &Value,
+    active: Option<&Value>,
+    limit: usize,
+    trusted: &HashSet<&str>,
+) -> Vec<Ingredient> {
+    let Some(manifest) = active else {
+        return Vec::new();
+    };
+
+    ingredient_items(manifest)
         .iter()
         .take(limit)
-        .map(|item| Ingredient {
-            title: text(item.get("title")),
-            relationship: text(item.get("relationship")),
-            credential_status: ingredient_status(item),
+        .map(|item| {
+            let origin = ingredient_manifest(store, item);
+            let listed = origin.is_some_and(|(label, _)| trusted.contains(label));
+            let status = match ingredient_status(item) {
+                Some(CredentialStatus::ValidUntrusted) if listed => {
+                    Some(CredentialStatus::ValidTrusted)
+                }
+                other => other,
+            };
+
+            Ingredient {
+                title: text(item.get("title")),
+                relationship: text(item.get("relationship")),
+                credential_status: status,
+                signer_name: origin.and_then(|(_, found)| signer_name(found)),
+            }
         })
         .collect()
 }
@@ -334,8 +498,10 @@ fn ingredient_status(item: &Value) -> Option<CredentialStatus> {
     let failed = item
         .get("validation_status")
         .and_then(Value::as_array)
-        .map(|list| !list.is_empty())
-        .unwrap_or(false);
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .any(|entry| entry.get("code").and_then(Value::as_str) != Some(CODE_UNTRUSTED));
     if failed {
         return Some(CredentialStatus::PresentInvalid);
     }
@@ -682,6 +848,230 @@ mod tests {
         }
         assert_eq!(declared_stronger.category, SourceCategory::AiGenerated);
         assert!(!declared_stronger.inherited);
+    }
+
+    fn signed(ingredients: Value) -> Value {
+        let mut out = manifest(None, ingredients);
+        out["signature_info"] =
+            serde_json::json!({"issuer": "Example Inc.", "common_name": "Example Signer"});
+
+        out
+    }
+
+    fn origin_of(state: &str, trusted: &[&str], manifests: Value) -> Origin {
+        let store = serde_json::json!({
+            "active_manifest": "urn:active",
+            "validation_state": state,
+            "trusted_manifests": trusted,
+            "manifests": manifests
+        });
+
+        build(
+            store,
+            engine(),
+            asset(),
+            &Options::default(),
+            TrustSelector::Official,
+        )
+        .origin
+    }
+
+    fn invalid(mut item: Value) -> Value {
+        item["validation_status"] = serde_json::json!([{"code": "assertion.dataHash.mismatch"}]);
+
+        item
+    }
+
+    #[test]
+    fn an_invalid_active_manifest_has_no_origin_even_with_a_listed_parent() {
+        let origin = origin_of(
+            "Invalid",
+            &["urn:parent"],
+            serde_json::json!({
+                "urn:active": signed(serde_json::json!([ingredient("parentOf", "urn:parent")])),
+                "urn:parent": signed(serde_json::json!([]))
+            }),
+        );
+
+        assert_eq!(origin, Origin::default());
+    }
+
+    #[test]
+    fn a_listed_parent_is_the_origin_and_an_unlisted_one_is_not() {
+        let manifests = serde_json::json!({
+            "urn:active": signed(serde_json::json!([ingredient("parentOf", "urn:parent")])),
+            "urn:parent": signed(serde_json::json!([]))
+        });
+
+        let traced = origin_of("Valid", &["urn:parent"], manifests.clone());
+        let untraced = origin_of("Valid", &[], manifests);
+
+        assert_eq!(
+            traced,
+            Origin {
+                status: OriginStatus::Traced,
+                signer_name: Some("Example Inc.".into()),
+                relationship: Some("parentOf".into()),
+                depth: Some(1),
+            }
+        );
+        assert_eq!(untraced, Origin::untraced());
+    }
+
+    #[test]
+    fn an_invalid_ingredient_on_the_path_ends_it() {
+        let direct = origin_of(
+            "Valid",
+            &["urn:parent"],
+            serde_json::json!({
+                "urn:active": signed(serde_json::json!([invalid(ingredient("parentOf", "urn:parent"))])),
+                "urn:parent": signed(serde_json::json!([]))
+            }),
+        );
+        let behind = origin_of(
+            "Valid",
+            &["urn:origin"],
+            serde_json::json!({
+                "urn:active": signed(serde_json::json!([ingredient("parentOf", "urn:middle")])),
+                "urn:middle": signed(serde_json::json!([invalid(ingredient("parentOf", "urn:origin"))])),
+                "urn:origin": signed(serde_json::json!([]))
+            }),
+        );
+
+        assert_eq!(direct, Origin::untraced());
+        assert_eq!(behind, Origin::untraced());
+    }
+
+    #[test]
+    fn a_parent_recorded_only_as_untrusted_is_still_followed() {
+        let mut item = ingredient("parentOf", "urn:parent");
+        item["validation_status"] = serde_json::json!([{"code": "signingCredential.untrusted"}]);
+
+        let origin = origin_of(
+            "Valid",
+            &["urn:origin"],
+            serde_json::json!({
+                "urn:active": signed(serde_json::json!([item])),
+                "urn:parent": signed(serde_json::json!([ingredient("parentOf", "urn:origin")])),
+                "urn:origin": signed(serde_json::json!([]))
+            }),
+        );
+
+        assert_eq!(origin.status, OriginStatus::Traced);
+        assert_eq!(origin.depth, Some(2));
+    }
+
+    #[test]
+    fn a_composite_is_traced_through_a_listed_component_unless_one_is_invalid() {
+        let listed = ingredient("componentOf", "urn:listed");
+        let unsigned = serde_json::json!({"relationship": "componentOf", "title": "plain.png"});
+        let unlisted = ingredient("componentOf", "urn:unlisted");
+        let manifests = |items: Value| {
+            serde_json::json!({
+                "urn:active": signed(items),
+                "urn:listed": signed(serde_json::json!([])),
+                "urn:unlisted": signed(serde_json::json!([]))
+            })
+        };
+
+        let mixed = origin_of(
+            "Valid",
+            &["urn:listed"],
+            manifests(serde_json::json!([unsigned, unlisted, listed])),
+        );
+        let broken = origin_of(
+            "Valid",
+            &["urn:listed"],
+            manifests(serde_json::json!([listed, invalid(unlisted.clone())])),
+        );
+        let none_listed = origin_of(
+            "Valid",
+            &["urn:listed"],
+            manifests(serde_json::json!([unsigned, unlisted])),
+        );
+
+        assert_eq!(mixed.status, OriginStatus::Traced);
+        assert_eq!(mixed.relationship.as_deref(), Some("componentOf"));
+        assert_eq!(mixed.depth, Some(1));
+        assert_eq!(broken, Origin::untraced());
+        assert_eq!(none_listed, Origin::untraced());
+    }
+
+    #[test]
+    fn the_nearest_listed_signer_is_reported_and_the_walk_stops_at_the_depth_limit() {
+        let label = format!("urn:{MAX_SOURCE_DEPTH}");
+        let beyond = format!("urn:{}", MAX_SOURCE_DEPTH + 1);
+
+        let near = origin_of("Valid", &[&label, "urn:2"], chain(MAX_SOURCE_DEPTH));
+        let at_limit = origin_of("Valid", &[&label], chain(MAX_SOURCE_DEPTH));
+        let far = origin_of("Valid", &[&beyond], chain(MAX_SOURCE_DEPTH + 1));
+        let cycle = origin_of(
+            "Valid",
+            &[],
+            serde_json::json!({
+                "urn:active": manifest(None, serde_json::json!([ingredient("parentOf", "urn:active")]))
+            }),
+        );
+
+        assert_eq!(near.depth, Some(2));
+        assert_eq!(at_limit.status, OriginStatus::Traced);
+        assert_eq!(at_limit.depth, Some(MAX_SOURCE_DEPTH as u32));
+        assert_eq!(far, Origin::untraced());
+        assert_eq!(cycle, Origin::untraced());
+    }
+
+    #[test]
+    fn a_trusted_active_manifest_is_its_own_origin() {
+        let origin = report("Trusted").origin;
+
+        assert_eq!(origin.status, OriginStatus::Traced);
+        assert_eq!(origin.depth, Some(0));
+        assert_eq!(origin.signer_name.as_deref(), Some("OpenAI Inc."));
+        assert_eq!(origin.relationship, None);
+        assert_eq!(report("Valid").origin, Origin::untraced());
+        assert_eq!(report("Invalid").origin, Origin::default());
+    }
+
+    #[test]
+    fn an_ingredient_names_its_signer_and_reads_trusted_when_listed() {
+        let store = serde_json::json!({
+            "active_manifest": "urn:active",
+            "validation_state": "Valid",
+            "trusted_manifests": ["urn:listed"],
+            "manifests": {
+                "urn:active": signed(serde_json::json!([
+                    ingredient("parentOf", "urn:listed"),
+                    ingredient("componentOf", "urn:unlisted"),
+                    invalid(ingredient("componentOf", "urn:listed")),
+                    {"relationship": "componentOf"}
+                ])),
+                "urn:listed": signed(serde_json::json!([])),
+                "urn:unlisted": {"signature_info": {"common_name": "Only A Name"}}
+            }
+        });
+
+        let report = build(
+            store,
+            engine(),
+            asset(),
+            &Options::default(),
+            TrustSelector::Official,
+        );
+        let seen: Vec<_> = report
+            .ingredients
+            .iter()
+            .map(|item| (item.credential_status, item.signer_name.as_deref()))
+            .collect();
+
+        assert_eq!(
+            seen,
+            [
+                (Some(CredentialStatus::ValidTrusted), Some("Example Inc.")),
+                (Some(CredentialStatus::ValidUntrusted), Some("Only A Name")),
+                (Some(CredentialStatus::PresentInvalid), Some("Example Inc.")),
+                (Some(CredentialStatus::Absent), None),
+            ]
+        );
     }
 
     #[test]

@@ -57,7 +57,7 @@ ok    node            Node.js 22.11.0
 |---|---|---|
 | `api_key` | `C2PA_API_KEY` (deprecated fallback `C2PA_DESIGN_API_KEY`) | not `c2pa_live_` / `c2pa_test_` + 32 letters and digits (unset is a warning) |
 | `network` | `C2PA_API_BASE` (deprecated fallback `C2PA_DESIGN_API_URL`, default `https://api.c2pa.design/v1`) | no HTTP answer |
-| `whoami` | `GET {C2PA_API_BASE}/whoami` | the key is refused; an exhausted quota is a warning |
+| `whoami` | `GET {C2PA_API_BASE}/whoami` | the key is refused (the reason the API gave is printed: `revoked`, `unknown`, `malformed`, a missing scope) or its project is archived; prints `project <name>`, `(default)` when the organization's default is used; an exhausted quota is a warning |
 | `webhook_secret` | `C2PA_WEBHOOK_SECRET` | not `whsec_` + standard base64 (unset is skipped) |
 | `node` | the Node.js running `npx` | older than 18 |
 
@@ -70,9 +70,11 @@ ok    node            Node.js 22.11.0
 
 ```json
 {
+  "project": "Storefront",
   "checks": [
-    { "name": "shipped", "paths": ["public/**/*.{jpg,png,webp}"], "baseline": "c2pa-baseline.json" },
-    { "name": "sources", "paths": ["design/**/*.png"], "coverage": 39, "git_tracked": true }
+    { "name": "shipped", "paths": ["public/**/*.{jpg,png,webp}"], "coverage": 100, "coverage_metric": "traced", "baseline": "c2pa-baseline.json" },
+    { "name": "sources", "paths": ["design/**/*.png"], "coverage": 39, "git_tracked": true },
+    { "name": "icons", "paths": ["public/icons/*.svg"], "expect": "absent" }
   ],
   "webhooks": [{ "url": "https://hooks.example.com/c2pa", "events": ["asset.lost", "monitor.regression"] }],
   "monitors": [{ "name": "CDN", "schedule": "hourly", "checkpoints": [{ "name": "hero", "url": "https://cdn.example.com/hero.jpg", "expect": "present_trusted" }] }],
@@ -88,8 +90,11 @@ c2pa-check apply --ping         # webhooks by URL, monitors by name, domains by 
 c2pa-check doctor --require api_key,webhook_secret
 ```
 
-| Flag | Meaning |
+| Key or flag | Meaning |
 |---|---|
+| `"project"` | project name, 1–64 characters; found or created on the first run (`PUT /projects`, once per run) and sent with `register`, `--register`, `apply` and hosted `carry`. `C2PA_PROJECT_ID` wins when set; with neither, nothing is sent and the server uses the key's project or `Default` |
+| `"coverage_metric"`, `--coverage-metric` | what `coverage` counts: `trusted` (default, signer on the trust list), `traced` (valid, and the chain of ingredients reaches a signer on the trust list) or `valid` (any intact credential). Text, JSON (`coverage {metric, expected, covered}` per file) and JUnit (`coverage_metric`, `coverage` properties) name it |
+| `"expect": "absent"` | the files are outside every coverage denominator and are registered with `expects_credential: false` |
 | `--baseline PATH` | fail when a file that had a valid credential in the baseline has lost it |
 | `--git-tracked` | only files git tracks, so local and CI runs count the same set |
 | `--format F --output P` (repeatable) | several reports from one run, paired by position |
@@ -116,13 +121,13 @@ process (the command does not wait for it) and prints what it sends. No file nam
     output: c2pa-check.xml
 ```
 
-The action installs the release named by `version` (default `v0.4.0`) and checks it against the
+The action installs the release named by `version` (default `v0.5.0`) and checks it against the
 release's `SHA256SUMS` before running it. Every release publishes `SHA256SUMS` and a GitHub
 build-provenance attestation (`gh attestation verify c2pa-check-<target>.tar.gz -R
 c2pa-design/c2pa-check`); the npm packages are published with npm provenance
 (`npm audit signatures`).
 
-Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.4.0`
+Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.5.0`
 (`node:22-bookworm-slim` is the smallest that also has the glibc tools most pipelines expect;
 the binary itself is static musl, so `node:22-alpine` works too). Pin the version so `npx` hits
 its cache instead of resolving `latest` on every run, and cache `~/.npm` between jobs; or skip

@@ -18,10 +18,11 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 pub use c2pa;
+use c2pa::crypto::cose::CertificateTrustPolicy;
 pub use error::Error;
 pub use report::{
-    Asset, Credential, CredentialStatus, EngineInfo, Metadata, Report, SourceCategory,
-    TrustSelector,
+    Asset, Credential, CredentialStatus, EngineInfo, Metadata, Origin, OriginStatus, Report,
+    SourceCategory, TrustSelector,
 };
 pub use trust::TrustBundle;
 
@@ -56,12 +57,24 @@ pub struct Verifier {
     context: Arc<c2pa::Context>,
     selector: TrustSelector,
     trust_list_version: String,
+    trust_policy: Option<CertificateTrustPolicy>,
 }
 
 impl Verifier {
     pub fn new(bundle: &TrustBundle, selector: TrustSelector) -> Result<Self, Error> {
         let anchors = bundle.anchors(selector);
         let verify_trust = !matches!(selector, TrustSelector::None) && !anchors.is_empty();
+
+        let trust_policy = verify_trust
+            .then(|| {
+                let mut policy = CertificateTrustPolicy::default();
+
+                policy
+                    .add_trust_anchors(anchors.as_bytes())
+                    .map(|()| policy)
+                    .map_err(|e| Error::TrustList(e.to_string()))
+            })
+            .transpose()?;
 
         let mut trust = serde_json::Map::new();
         if verify_trust {
@@ -89,6 +102,7 @@ impl Verifier {
             context: context.into_shared(),
             selector,
             trust_list_version: bundle.version.clone(),
+            trust_policy,
         })
     }
 
@@ -208,10 +222,51 @@ impl Verifier {
                 "validation_state".into(),
                 serde_json::Value::String(format!("{:?}", reader.validation_state())),
             );
+            map.insert(
+                extract::TRUSTED_MANIFESTS.into(),
+                serde_json::Value::from(self.trusted_manifests(&reader)),
+            );
         }
 
         Ok(Some(store))
     }
+
+    fn trusted_manifests(&self, reader: &c2pa::Reader) -> Vec<String> {
+        let Some(policy) = &self.trust_policy else {
+            return Vec::new();
+        };
+        let mut labels: Vec<&String> = reader.manifests().keys().collect();
+        labels.sort();
+
+        labels
+            .into_iter()
+            .take(extract::MAX_TRUSTED_MANIFESTS)
+            .filter(|label| {
+                reader
+                    .get_manifest(label)
+                    .and_then(c2pa::Manifest::signature_info)
+                    .is_some_and(|info| chain_trusted(policy, info.cert_chain()))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn chain_trusted(policy: &CertificateTrustPolicy, chain_pem: &str) -> bool {
+    let Ok(blocks) = pem::parse_many(chain_pem) else {
+        return false;
+    };
+    let chain: Vec<Vec<u8>> = blocks
+        .into_iter()
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(pem::Pem::into_contents)
+        .collect();
+
+    chain.split_first().is_some_and(|(end_entity, rest)| {
+        policy
+            .check_certificate_trust(rest, end_entity, None)
+            .is_ok()
+    })
 }
 
 pub fn verify(

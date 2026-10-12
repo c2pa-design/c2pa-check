@@ -5,7 +5,7 @@ use base64::Engine as _;
 use clap::Args;
 use serde_json::{json, Value};
 
-use crate::api::{scoped, Api};
+use crate::api::Api;
 use crate::carry_cmd::write_private;
 use crate::config::Config;
 use crate::env;
@@ -37,7 +37,7 @@ pub struct ApplyArgs {
 }
 
 pub fn run(args: &ApplyArgs, config: &Config) -> anyhow::Result<u8> {
-    let api = Api::from_env()?;
+    let api = Api::from_env()?.with_project(config.project.clone());
 
     webhooks(&api, args, config)?;
     monitors(&api, config)?;
@@ -142,7 +142,7 @@ fn monitors(api: &Api, config: &Config) -> anyhow::Result<()> {
         if name.is_empty() {
             anyhow::bail!("every monitor needs a name");
         }
-        let body = scoped(monitor.clone());
+        let body = api.scoped(monitor.clone())?;
         match items(&existing).find(|m| text(m, "name") == name) {
             Some(found) => {
                 api.call(
@@ -173,7 +173,11 @@ fn domains(api: &Api, config: &Config, wait: Duration) -> anyhow::Result<bool> {
         let found = items(&existing).find(|d| text(d, "host").eq_ignore_ascii_case(host));
         let domain = match found {
             Some(domain) => domain.clone(),
-            None => api.call("POST", "/domains", Some(&scoped(json!({ "host": host }))))?,
+            None => api.call(
+                "POST",
+                "/domains",
+                Some(&api.scoped(json!({ "host": host }))?),
+            )?,
         };
         if text(&domain, "state") == "pending" {
             pending.push(domain);
@@ -296,6 +300,53 @@ mod tests {
         let put: Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert_eq!(put["secret"], reused);
         assert_eq!(put["events"], json!(["asset.lost"]));
+    }
+
+    #[test]
+    fn the_project_named_in_the_config_is_resolved_once_and_sent_with_new_monitors_and_domains() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (base, server) = serve(5, move |request| {
+            if !request.body.is_empty() {
+                tx.send(serde_json::from_slice::<Value>(&request.body).unwrap())
+                    .unwrap();
+            }
+            let body = match request.path.as_str() {
+                "/v1/projects" => r#"{"id":"p-1","name":"Storefront"}"#,
+                "/v1/domains" if !request.body.is_empty() => {
+                    r#"{"id":"d1","host":"new.example","state":"verified"}"#
+                }
+                _ => r#"{"items":[]}"#,
+            };
+            (200, body.to_string())
+        });
+        let config: Config = serde_json::from_str(
+            r#"{"project":"Storefront","monitors":[{"name":"CDN","checkpoints":[]}],"domains":["new.example"]}"#,
+        )
+        .unwrap();
+        let api = Api::new(base, "k".into())
+            .without_waiting()
+            .with_project_id(None)
+            .with_project(config.project.clone());
+
+        monitors(&api, &config).unwrap();
+        domains(&api, &config, Duration::ZERO).unwrap();
+
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "/v1/monitors",
+                "/v1/projects",
+                "/v1/monitors",
+                "/v1/domains",
+                "/v1/domains"
+            ]
+        );
+        assert_eq!(rx.recv().unwrap(), json!({"name": "Storefront"}));
+        assert_eq!(rx.recv().unwrap()["project_id"], "p-1");
+        assert_eq!(
+            rx.recv().unwrap(),
+            json!({"host": "new.example", "project_id": "p-1"})
+        );
     }
 
     #[test]

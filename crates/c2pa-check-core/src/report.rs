@@ -38,6 +38,45 @@ pub enum SourceCategory {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginStatus {
+    Traced,
+    Untraced,
+    #[default]
+    None,
+}
+
+impl OriginStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Traced => "traced",
+            Self::Untraced => "untraced",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Origin {
+    pub status: OriginStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+}
+
+impl Origin {
+    pub fn untraced() -> Self {
+        Self {
+            status: OriginStatus::Untraced,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustSelector {
@@ -89,6 +128,8 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claim: Option<Claim>,
     pub source: Source,
+    #[serde(default)]
+    pub origin: Origin,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<Action>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -194,6 +235,8 @@ pub struct Ingredient {
     pub relationship: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_status: Option<CredentialStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -246,6 +289,7 @@ impl Report {
             signer: None,
             claim: None,
             source: Source::unknown(),
+            origin: Origin::default(),
             actions: Vec::new(),
             ingredients: Vec::new(),
             validation: Validation::default(),
@@ -335,6 +379,7 @@ mod tests {
         assert!(value["asset"].get("pdq_mirrors").is_none());
         assert!(value["asset"].get("pdq_frames").is_none());
         assert_eq!(value["credential"]["status"], "absent");
+        assert_eq!(value["origin"], serde_json::json!({"status": "none"}));
         assert_eq!(value["schema_version"], SCHEMA_VERSION);
     }
 
