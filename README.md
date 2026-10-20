@@ -113,7 +113,7 @@ process (the command does not wait for it) and prints what it sends. No file nam
 ## In CI
 
 ```yaml
-- uses: c2pa-design/c2pa-check-action@v1
+- uses: c2pa-design/c2pa-check/action@v0.5.0
   with:
     paths: "public/**/*.{jpg,png,webp}"
     coverage: 100
