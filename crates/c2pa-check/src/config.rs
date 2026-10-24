@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
     pub checks: Vec<Check>,
     #[serde(default)]
     pub webhooks: Vec<Webhook>,
@@ -93,7 +95,7 @@ mod tests {
     fn a_config_parses_and_a_typo_is_an_error_not_a_silent_default() {
         let good: Config = serde_json::from_str(
             r#"{"$schema":"https://c2pa.design/schemas/c2pa.v1.json",
-                "project":"Storefront",
+                "project":"Storefront","organization":"acme",
                 "checks":[{"name":"sources","paths":["design/**/*.png"],"coverage":39,"coverage_metric":"traced","expect":"present"}],
                 "webhooks":[{"url":"https://h/hook","events":["asset.lost"]}],
                 "monitors":[{"name":"CDN"}],"domains":["example.com"]}"#,
@@ -105,6 +107,7 @@ mod tests {
         assert_eq!(good.checks[0].coverage, Some(39.0));
         assert_eq!(good.checks[0].coverage_metric, Some(Metric::Traced));
         assert_eq!(good.project.as_deref(), Some("Storefront"));
+        assert_eq!(good.organization.as_deref(), Some("acme"));
         assert!(serde_json::from_str::<Config>(r#"{"projekt":"a"}"#).is_err());
         assert!(serde_json::from_str::<Config>(
             r#"{"checks":[{"name":"a","paths":[],"coverage_metric":"signed"}]}"#

@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "c2pa-check"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "c2pa-check-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "c2pa",
  "chrono",

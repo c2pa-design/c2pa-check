@@ -330,6 +330,10 @@ fn main() -> ExitCode {
 }
 
 fn run(mut cli: Cli) -> anyhow::Result<u8> {
+    if let Ok(Some(config)) = config::load(cli.config.as_deref()) {
+        env::set_config_organization(config.organization);
+    }
+
     match cli.command.take() {
         Some(Command::Completions { shell }) => {
             output::completions(shell);

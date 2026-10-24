@@ -43,10 +43,13 @@ pub struct Api {
 
 impl Api {
     pub fn from_env() -> anyhow::Result<Self> {
-        let key = env::api_key().ok_or_else(|| {
-            anyhow::anyhow!(
+        let key = env::api_key().ok_or_else(|| match env::organization() {
+            Some(org) => anyhow::anyhow!(
+                "C2PA_API_KEY is not set and no key for {org} is saved; run `c2pa-check login` and approve it in {org}"
+            ),
+            None => anyhow::anyhow!(
                 "C2PA_API_KEY is not set (create one at https://app.c2pa.design, API keys)"
-            )
+            ),
         })?;
 
         Ok(Self::new(env::api_base(), key))

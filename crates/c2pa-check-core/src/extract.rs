@@ -1348,15 +1348,16 @@ mod tests {
         );
 
         assert!(report.validation.errors.is_empty());
-        let warnings: Vec<_> = report
+        let mut warnings: Vec<_> = report
             .validation
             .warnings
             .iter()
             .map(|w| w.code.as_str())
             .collect();
+        warnings.sort_unstable();
         assert_eq!(
             warnings,
-            ["timeStamp.untrusted", "signingCredential.untrusted"]
+            ["signingCredential.untrusted", "timeStamp.untrusted"]
         );
     }
 

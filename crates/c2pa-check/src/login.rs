@@ -67,9 +67,9 @@ pub fn run(args: &LoginArgs) -> anyhow::Result<u8> {
 
     let path = env::credentials_path()
         .ok_or_else(|| anyhow::anyhow!("no home directory to keep the key in; set HOME"))?;
-    save(&path, &key)?;
+    save(&path, &organization, &key)?;
     eprintln!(
-        "Signed in to {organization}. The {mode} key is saved in {} and used when C2PA_API_KEY is not set.",
+        "Signed in to {organization}. The {mode} key is saved in {} under {organization} and used when C2PA_API_KEY is not set.",
         path.display()
     );
 
@@ -131,13 +131,28 @@ fn approved(state: &Value) -> Option<(String, String)> {
     })
 }
 
-fn save(path: &Path, key: &str) -> anyhow::Result<()> {
+fn save(path: &Path, organization: &str, key: &str) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|err| anyhow::anyhow!("creating {}: {err}", dir.display()))?;
     }
 
-    write_private(path, format!("{key}\n").as_bytes())
+    let old = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => anyhow::bail!(
+            "reading {}: {err}; the saved keys are left as they are",
+            path.display()
+        ),
+    };
+    let mut text = format!("{organization}:{key}\n");
+    for (id, saved) in env::parse_credentials(&old) {
+        if id != organization {
+            text.push_str(&format!("{id}:{saved}\n"));
+        }
+    }
+
+    write_private(path, text.as_bytes())
 }
 
 fn ci_command(target: CiTarget) -> (&'static str, &'static [&'static str]) {
@@ -248,8 +263,11 @@ mod tests {
         let path = dir.join("nested").join("credentials");
         let sink = dir.join("sink");
 
-        save(&path, "c2pa_live_x").unwrap();
+        save(&path, "acme", "c2pa_live_old").unwrap();
+        save(&path, "drc", "c2pa_live_d").unwrap();
+        save(&path, "acme", "c2pa_live_x").unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
+        let unreadable = save(&dir.join("nested"), "acme", "c2pa_live_y");
         let piped = store_secret(
             "sh",
             &["-c", &format!("cat > {}", sink.display())],
@@ -260,7 +278,11 @@ mod tests {
         let failing = store_secret("sh", &["-c", "cat >/dev/null; exit 3"], "k");
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(saved, "c2pa_live_x\n");
+        assert_eq!(saved, "acme:c2pa_live_x\ndrc:c2pa_live_d\n");
+        assert!(unreadable
+            .unwrap_err()
+            .to_string()
+            .contains("left as they are"));
         assert!(piped.is_ok());
         assert_eq!(received, "c2pa_live_x");
         assert!(missing.unwrap_err().to_string().contains("by hand"));

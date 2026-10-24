@@ -92,6 +92,7 @@ c2pa-check doctor --require api_key,webhook_secret
 
 | Key or flag | Meaning |
 |---|---|
+| `"organization"` | organization slug; picks its key from the `organization:key` lines `login` writes to `~/.config/c2pa-check/credentials` when `C2PA_API_KEY` is unset. `C2PA_ORG` wins; a named organization without a saved key means no key. Without either, the latest login is used |
 | `"project"` | project name, 1–64 characters; found or created on the first run (`PUT /projects`, once per run) and sent with `register`, `--register`, `apply` and hosted `carry`. `C2PA_PROJECT_ID` wins when set; with neither, nothing is sent and the server uses the key's project or `Default` |
 | `"coverage_metric"`, `--coverage-metric` | what `coverage` counts: `trusted` (default, signer on the trust list), `traced` (valid, and the chain of ingredients reaches a signer on the trust list) or `valid` (any intact credential). Text, JSON (`coverage {metric, expected, covered}` per file) and JUnit (`coverage_metric`, `coverage` properties) name it |
 | `"expect": "absent"` | the files are outside every coverage denominator and are registered with `expects_credential: false` |
@@ -113,7 +114,7 @@ process (the command does not wait for it) and prints what it sends. No file nam
 ## In CI
 
 ```yaml
-- uses: c2pa-design/c2pa-check/action@v0.6.1
+- uses: c2pa-design/c2pa-check/action@v0.6.2
   with:
     paths: "public/**/*.{jpg,png,webp}"
     coverage: 100
@@ -121,13 +122,13 @@ process (the command does not wait for it) and prints what it sends. No file nam
     output: c2pa-check.xml
 ```
 
-The action installs the release named by `version` (default `v0.6.1`) and checks it against the
+The action installs the release named by `version` (default `v0.6.2`) and checks it against the
 release's `SHA256SUMS` before running it. Every release publishes `SHA256SUMS` and a GitHub
 build-provenance attestation (`gh attestation verify c2pa-check-<target>.tar.gz -R
 c2pa-design/c2pa-check`); the npm packages are published with npm provenance
 (`npm audit signatures`).
 
-Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.6.1`
+Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.6.2`
 (`node:22-bookworm-slim` is the smallest that also has the glibc tools most pipelines expect;
 the binary itself is static musl, so `node:22-alpine` works too). Pin the version so `npx` hits
 its cache instead of resolving `latest` on every run, and cache `~/.npm` between jobs; or skip

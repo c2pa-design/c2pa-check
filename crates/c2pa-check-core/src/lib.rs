@@ -29,7 +29,7 @@ pub use trust::TrustBundle;
 pub const ENGINE_NAME: &str = "c2pa-check-core";
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const C2PA_VERSION: &str = "0.91.5";
-pub const VALID_EKUS: &str = include_str!("valid_ekus.cfg");
+const VALID_EKUS: &str = include_str!("valid_ekus.cfg");
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -262,10 +262,10 @@ impl Verifier {
 fn signed_at(time: Option<&str>) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(time?)
         .ok()
-        .map(|time| time.timestamp())
+        .map(|parsed| parsed.timestamp())
 }
 
-fn chain_trusted(policy: &CertificateTrustPolicy, chain_pem: &str, signed_at: Option<i64>) -> bool {
+fn chain_trusted(policy: &CertificateTrustPolicy, chain_pem: &str, at: Option<i64>) -> bool {
     let Ok(blocks) = pem::parse_many(chain_pem) else {
         return false;
     };
@@ -276,9 +276,7 @@ fn chain_trusted(policy: &CertificateTrustPolicy, chain_pem: &str, signed_at: Op
         .collect();
 
     chain.split_first().is_some_and(|(end_entity, rest)| {
-        policy
-            .check_certificate_trust(rest, end_entity, signed_at)
-            .is_ok()
+        policy.check_certificate_trust(rest, end_entity, at).is_ok()
     })
 }
 
