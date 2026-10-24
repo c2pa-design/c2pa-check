@@ -69,7 +69,10 @@ fn jpeg(image: &DynamicImage) -> Vec<u8> {
 fn sign_generated(png: Vec<u8>, identity: &LocalIdentity) -> Vec<u8> {
     let signer = local_signer(&identity.chain_pem, &identity.key_pem, None).expect("signer");
     let context = c2pa::Context::new()
-        .with_settings(json!({"builder": {"thumbnail": {"enabled": false}}}))
+        .with_settings(json!({
+            "builder": {"thumbnail": {"enabled": false}},
+            "verify": {"verify_after_sign": false}
+        }))
         .expect("context");
     let mut builder = c2pa::Builder::from_context(context)
         .with_definition(json!({
@@ -351,7 +354,10 @@ fn forged(
         placeholder,
     );
     let context = c2pa::Context::new()
-        .with_settings(json!({"builder": {"thumbnail": {"enabled": false}}}))
+        .with_settings(json!({
+            "builder": {"thumbnail": {"enabled": false}},
+            "verify": {"verify_after_sign": false}
+        }))
         .expect("context");
     let mut builder = c2pa::Builder::from_context(context)
         .with_definition(definition)

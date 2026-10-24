@@ -553,7 +553,13 @@ fn validation_entries(store: &Value) -> Validation {
                     continue;
                 }
                 for entry in list.as_array().map(Vec::as_slice).unwrap_or_default() {
-                    consider(entry, &mut out, &mut seen);
+                    let warning = entry
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .is_some_and(explain::is_warning);
+                    if name != "informational" || warning {
+                        consider(entry, &mut out, &mut seen);
+                    }
                 }
             }
         }
@@ -1318,6 +1324,40 @@ mod tests {
         );
 
         assert_eq!(report.validation.errors.len(), 1);
+    }
+
+    #[test]
+    fn an_informational_code_is_dropped_unless_we_report_it_as_a_warning() {
+        let store = serde_json::json!({
+            "validation_state": "Valid",
+            "validation_results": {"activeManifest": {
+                "informational": [
+                    {"code": "signingCredential.ocsp.skipped"},
+                    {"code": "timeStamp.untrusted"}
+                ],
+                "failure": [{"code": "signingCredential.untrusted"}]
+            }}
+        });
+
+        let report = build(
+            store,
+            engine(),
+            asset(),
+            &Options::default(),
+            TrustSelector::Official,
+        );
+
+        assert!(report.validation.errors.is_empty());
+        let warnings: Vec<_> = report
+            .validation
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect();
+        assert_eq!(
+            warnings,
+            ["timeStamp.untrusted", "signingCredential.untrusted"]
+        );
     }
 
     #[test]

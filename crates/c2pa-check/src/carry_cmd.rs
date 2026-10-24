@@ -1776,7 +1776,10 @@ mod tests {
     fn signed_png(identity: &LocalIdentity) -> Vec<u8> {
         let signer = carry::local_signer(&identity.chain_pem, &identity.key_pem, None).unwrap();
         let context = c2pa::Context::new()
-            .with_settings(serde_json::json!({"builder": {"thumbnail": {"enabled": false}}}))
+            .with_settings(serde_json::json!({
+                "builder": {"thumbnail": {"enabled": false}},
+                "verify": {"verify_after_sign": false}
+            }))
             .unwrap();
         let mut builder = c2pa::Builder::from_context(context)
             .with_definition(serde_json::json!({

@@ -18,7 +18,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 pub use c2pa;
-use c2pa::crypto::cose::CertificateTrustPolicy;
+use c2pa::crypto::cose::{CertificateTrustPolicy, TrustAnchorType};
 pub use error::Error;
 pub use report::{
     Asset, Credential, CredentialStatus, EngineInfo, Metadata, Origin, OriginStatus, Report,
@@ -28,7 +28,8 @@ pub use trust::TrustBundle;
 
 pub const ENGINE_NAME: &str = "c2pa-check-core";
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const C2PA_VERSION: &str = "0.90.20";
+pub const C2PA_VERSION: &str = "0.91.5";
+pub const VALID_EKUS: &str = include_str!("valid_ekus.cfg");
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -70,13 +71,17 @@ impl Verifier {
                 let mut policy = CertificateTrustPolicy::default();
 
                 policy
-                    .add_trust_anchors(anchors.as_bytes())
+                    .add_trust_anchors(anchors.as_bytes(), "", TrustAnchorType::Manifest, None)
                     .map(|()| policy)
                     .map_err(|e| Error::TrustList(e.to_string()))
             })
             .transpose()?;
 
         let mut trust = serde_json::Map::new();
+        trust.insert(
+            "trust_config".to_string(),
+            serde_json::Value::String(VALID_EKUS.to_string()),
+        );
         if verify_trust {
             trust.insert(
                 "trust_anchors".to_string(),
@@ -245,14 +250,22 @@ impl Verifier {
                 reader
                     .get_manifest(label)
                     .and_then(c2pa::Manifest::signature_info)
-                    .is_some_and(|info| chain_trusted(policy, info.cert_chain()))
+                    .is_some_and(|info| {
+                        chain_trusted(policy, info.cert_chain(), signed_at(info.time.as_deref()))
+                    })
             })
             .cloned()
             .collect()
     }
 }
 
-fn chain_trusted(policy: &CertificateTrustPolicy, chain_pem: &str) -> bool {
+fn signed_at(time: Option<&str>) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(time?)
+        .ok()
+        .map(|time| time.timestamp())
+}
+
+fn chain_trusted(policy: &CertificateTrustPolicy, chain_pem: &str, signed_at: Option<i64>) -> bool {
     let Ok(blocks) = pem::parse_many(chain_pem) else {
         return false;
     };
@@ -264,7 +277,7 @@ fn chain_trusted(policy: &CertificateTrustPolicy, chain_pem: &str) -> bool {
 
     chain.split_first().is_some_and(|(end_entity, rest)| {
         policy
-            .check_certificate_trust(rest, end_entity, None)
+            .check_certificate_trust(rest, end_entity, signed_at)
             .is_ok()
     })
 }
@@ -277,4 +290,75 @@ pub fn verify(
     options: &Options,
 ) -> Result<Report, Error> {
     Verifier::new(bundle, selector)?.verify(bytes, mime_type, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use rcgen::{
+        date_time_ymd, BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    };
+
+    use super::*;
+
+    const INSIDE_VALIDITY: &str = "2025-03-01T00:00:00+00:00";
+
+    fn expired_chain() -> (String, String) {
+        let ca_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("ca key");
+        let mut ca = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca.distinguished_name.push(DnType::CommonName, "test CA");
+        ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        ca.not_before = date_time_ymd(2020, 1, 1);
+        ca.use_authority_key_identifier_extension = true;
+        ca.not_after = date_time_ymd(2045, 1, 1);
+        let ca_cert = ca.self_signed(&ca_key).expect("ca");
+
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut leaf = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+        leaf.distinguished_name
+            .push(DnType::CommonName, "test leaf");
+        leaf.is_ca = IsCa::ExplicitNoCa;
+        leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::Other(vec![
+            1, 3, 6, 1, 5, 5, 7, 3, 36,
+        ])];
+        leaf.not_before = date_time_ymd(2025, 1, 1);
+        leaf.not_after = date_time_ymd(2025, 6, 1);
+        leaf.use_authority_key_identifier_extension = true;
+        let leaf_cert = leaf.signed_by(&leaf_key, &ca_cert, &ca_key).expect("leaf");
+
+        (
+            format!("{}{}", leaf_cert.pem(), ca_cert.pem()),
+            ca_cert.pem(),
+        )
+    }
+
+    #[test]
+    fn an_expired_chain_is_trusted_only_at_its_signing_time() {
+        let (chain, anchor) = expired_chain();
+        let mut policy = CertificateTrustPolicy::default();
+        policy
+            .add_trust_anchors(anchor.as_bytes(), "", TrustAnchorType::Manifest, None)
+            .expect("anchor");
+
+        assert!(!chain_trusted(&policy, &chain, None));
+        assert!(chain_trusted(
+            &policy,
+            &chain,
+            signed_at(Some(INSIDE_VALIDITY))
+        ));
+        assert!(!chain_trusted(
+            &policy,
+            &chain,
+            signed_at(Some("not a time"))
+        ));
+    }
+
+    #[test]
+    fn signing_time_is_read_from_rfc3339_only() {
+        assert_eq!(signed_at(None), None);
+        assert_eq!(signed_at(Some("garbage")), None);
+        assert_eq!(signed_at(Some("1970-01-01T00:01:00+00:00")), Some(60));
+    }
 }

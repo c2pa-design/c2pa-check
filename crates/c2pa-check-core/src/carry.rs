@@ -302,7 +302,8 @@ fn builder(
     }
     let context = c2pa::Context::new()
         .with_settings(json!({
-            "verify": {"remote_manifest_fetch": false, "ocsp_fetch": false},
+            "verify": {"remote_manifest_fetch": false, "ocsp_fetch": false, "verify_after_sign": false},
+            "trust": {"trust_config": crate::VALID_EKUS},
             "builder": {"thumbnail": {"enabled": false}}
         }))
         .map_err(|e| CarryError::Sign(e.to_string()))?;
@@ -319,7 +320,8 @@ fn builder(
 
 fn read_context() -> Result<c2pa::Context, c2pa::Error> {
     c2pa::Context::new().with_settings(json!({
-        "verify": {"remote_manifest_fetch": false, "ocsp_fetch": false, "verify_trust": false}
+        "verify": {"remote_manifest_fetch": false, "ocsp_fetch": false, "verify_trust": false},
+        "trust": {"trust_config": crate::VALID_EKUS}
     }))
 }
 

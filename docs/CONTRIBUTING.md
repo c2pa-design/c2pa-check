@@ -10,14 +10,3 @@
    to `schema/result.v1.json` is a new schema version, not an edit.
 6. CI runs default features. `avif` and `heic` link dav1d and libheif ≥ 1.23, which the engine
    image builds from source; the engine's CI covers them.
-
-## Audit exceptions
-
-`cargo audit` reads `.cargo/audit.toml`. Every ignored advisory reaches us through the pinned
-`c2pa` crate and goes when a `c2pa` release drops it.
-
-| Advisory | Crate | Why it does not apply |
-|---|---|---|
-| RUSTSEC-2023-0071 | `rsa` 0.9 | Marvin is a timing attack on RSA private-key operations; we only verify RSA signatures and sign with ES256 |
-| RUSTSEC-2026-0387 | `crypto-bigint` 0.5 | timing variance in ECDSA signing; the only key we sign with is the local key on the user's own machine, never a remote request |
-| RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369 | `zip` 8 | all three are in `ZipArchive::extract` / `ZipStreamReader::extract`; `c2pa` reads archives in memory and never calls them |
