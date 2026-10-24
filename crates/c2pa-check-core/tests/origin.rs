@@ -70,6 +70,7 @@ fn carried(source: &[u8], source_mime: &str, image: &DynamicImage, format: Image
         force: false,
         title: Some("carried".into()),
         max_pixels: 100_000_000,
+        soft_binding: None,
     };
 
     carry::carry(

@@ -113,7 +113,7 @@ process (the command does not wait for it) and prints what it sends. No file nam
 ## In CI
 
 ```yaml
-- uses: c2pa-design/c2pa-check/action@v0.5.0
+- uses: c2pa-design/c2pa-check/action@v0.6.0
   with:
     paths: "public/**/*.{jpg,png,webp}"
     coverage: 100
@@ -121,13 +121,13 @@ process (the command does not wait for it) and prints what it sends. No file nam
     output: c2pa-check.xml
 ```
 
-The action installs the release named by `version` (default `v0.5.0`) and checks it against the
+The action installs the release named by `version` (default `v0.6.0`) and checks it against the
 release's `SHA256SUMS` before running it. Every release publishes `SHA256SUMS` and a GitHub
 build-provenance attestation (`gh attestation verify c2pa-check-<target>.tar.gz -R
 c2pa-design/c2pa-check`); the npm packages are published with npm provenance
 (`npm audit signatures`).
 
-Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.5.0`
+Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.6.0`
 (`node:22-bookworm-slim` is the smallest that also has the glibc tools most pipelines expect;
 the binary itself is static musl, so `node:22-alpine` works too). Pin the version so `npx` hits
 its cache instead of resolving `latest` on every run, and cache `~/.npm` between jobs; or skip
@@ -151,6 +151,7 @@ c2pa-check keygen --out-dir .c2pa                                  # cert.pem + 
 c2pa-check carry --from hero.png --to hero.webp --json            # machine-readable result
 c2pa-check carry --from gen.png --to cut.png --edited             # carry, or an edit if the picture changed
 c2pa-check carry --from hero.png --to tmp.webp --out public/hero.webp   # a rerun keeps the signed file
+c2pa-check carry --from hero.png --to hero.webp --watermark      # also an invisible TrustMark (C2PA_API_KEY)
 ```
 
 | Signer (first that is set) | Signed as | Verifies as |
@@ -170,6 +171,7 @@ Never `COPY` or `ARG` a key into a Docker image: use `RUN --mount=type=secret`.
 | `--out` already holds a valid credential from the same sources and the same pixels as `--to` | `skipped`: the file is untouched, nothing is sent, no signature is spent |
 | `--out` was signed with the local key and a key or certificate is now set | signed again |
 | `--from-dir` and an original holds no credential | `unsigned`, passed over, exit `0` (`--strict`: exit `1`) |
+| `--watermark` (needs `C2PA_API_KEY`) | c2pa.design embeds an Adobe TrustMark with an identifier issued to your organization and the manifest gets a `c2pa.soft-binding` assertion, so a copy that loses its credential is matched to the original. JPEG, PNG, WebP only (`watermark_unsupported`, exit `5`); not with `--compose`; a rerun with `--out` keeps the watermarked file |
 | Size | a credential adds about 6 KB plus the manifest store of each signed source (22 KB in a generator PNG we measured) |
 
 `carry --json` prints one object (an array for several files):

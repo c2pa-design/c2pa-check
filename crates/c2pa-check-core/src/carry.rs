@@ -24,11 +24,14 @@ const ALLOWED_ACTIONS: [&str; 5] = [
     "c2pa.compressed",
 ];
 const COMPOSE_ACTIONS: [&str; 4] = ["c2pa.created", "c2pa.placed", "c2pa.opened", "c2pa.edited"];
-const ALLOWED_ASSERTIONS: [&str; 4] = [
+pub const SOFT_BINDING_LABEL: &str = "c2pa.soft-binding";
+const WATERMARK_DISTANCE: u32 = 20;
+const ALLOWED_ASSERTIONS: [&str; 5] = [
     "c2pa.actions",
     "c2pa.ingredient",
     "c2pa.hash.",
     "c2pa.thumbnail.",
+    SOFT_BINDING_LABEL,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +90,13 @@ pub struct CarryOptions {
     pub force: bool,
     pub title: Option<String>,
     pub max_pixels: u64,
+    pub soft_binding: Option<SoftBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftBinding {
+    pub algorithm: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +154,7 @@ pub fn carry(
         derived_mime,
         options.title.as_deref().unwrap_or("carried"),
         parent_actions,
+        options.soft_binding.as_ref(),
     )?;
     let parent = json!({
         "title": "source",
@@ -231,6 +242,7 @@ pub fn compose(
         output_mime,
         title.unwrap_or("composite"),
         actions,
+        None,
     )?;
     let mut with_credentials = 0;
     for (index, (component, label)) in components.iter().zip(&labels).enumerate() {
@@ -279,7 +291,15 @@ fn builder(
     mime: &str,
     title: &str,
     actions: Vec<Value>,
+    soft_binding: Option<&SoftBinding>,
 ) -> Result<c2pa::Builder, CarryError> {
+    let mut assertions = vec![json!({"label": "c2pa.actions", "data": {"actions": actions}})];
+    if let Some(binding) = soft_binding {
+        assertions.push(json!({
+            "label": SOFT_BINDING_LABEL,
+            "data": {"alg": binding.algorithm, "blocks": [{"scope": {}, "value": binding.value}]}
+        }));
+    }
     let context = c2pa::Context::new()
         .with_settings(json!({
             "verify": {"remote_manifest_fetch": false, "ocsp_fetch": false},
@@ -292,7 +312,7 @@ fn builder(
             "claim_generator_info": [{"name": generator, "version": ENGINE_VERSION}],
             "title": title,
             "format": base_mime(mime),
-            "assertions": [{"label": "c2pa.actions", "data": {"actions": actions}}]
+            "assertions": assertions
         }))
         .map_err(|e| CarryError::Sign(e.to_string()))
 }
@@ -387,6 +407,41 @@ pub fn same_pixels(a: (&[u8], &str), b: (&[u8], &str), max_pixels: u64) -> bool 
         && a.height() == b.height()
         && a.color() == b.color()
         && a.as_bytes() == b.as_bytes()
+}
+
+pub fn watermarked_from(
+    (signed, signed_mime): (&[u8], &str),
+    (unsigned, unsigned_mime): (&[u8], &str),
+    max_pixels: u64,
+) -> bool {
+    let marked = store(signed, signed_mime).is_some_and(|store| {
+        active_label(&store)
+            .and_then(|active| store.get("manifests")?.get(active)?.get("assertions"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("label")
+                        .and_then(Value::as_str)
+                        .is_some_and(|label| label.starts_with(SOFT_BINDING_LABEL))
+                })
+            })
+    });
+    let (Some(signed_format), Some(unsigned_format)) = (
+        media::format_for(signed_mime),
+        media::format_for(unsigned_mime),
+    ) else {
+        return false;
+    };
+
+    marked
+        && !resized(signed, unsigned, max_pixels)
+        && matches!(
+            compare(
+                &pdq::fingerprint(signed, signed_format, max_pixels),
+                &pdq::fingerprint(unsigned, unsigned_format, max_pixels),
+            ),
+            Comparison::Distance(d) if d <= WATERMARK_DISTANCE
+        )
 }
 
 fn source_state(source: &[u8], format: &str) -> Result<bool, CarryError> {

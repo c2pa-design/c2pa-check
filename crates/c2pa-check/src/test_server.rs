@@ -51,6 +51,20 @@ pub fn serve(
     requests: usize,
     handler: impl Fn(&Request) -> (u16, String) + Send + 'static,
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    serve_raw(requests, move |request| {
+        let (status, body) = handler(request);
+        (
+            status,
+            "Content-Type: application/json\r\n".to_string(),
+            body.into_bytes(),
+        )
+    })
+}
+
+pub fn serve_raw(
+    requests: usize,
+    handler: impl Fn(&Request) -> (u16, String, Vec<u8>) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::Write;
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -60,13 +74,13 @@ pub fn serve(
         for _ in 0..requests {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_request(&mut stream);
-            let (status, body) = handler(&request);
+            let (status, headers, body) = handler(&request);
             let _ = write!(
                 stream,
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} X\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
-            )
-            ;
+            );
+            let _ = stream.write_all(&body);
             paths.push(request.path);
         }
         paths

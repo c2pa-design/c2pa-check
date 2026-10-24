@@ -55,9 +55,9 @@ inputs:
     required: false
     default: ""
   version:
-    description: Release tag of c2pa-check to run (e.g. v0.5.0), or latest.
+    description: Release tag of c2pa-check to run (e.g. v0.6.0), or latest.
     required: false
-    default: v0.5.0
+    default: v0.6.0
 
 outputs:
   coverage:

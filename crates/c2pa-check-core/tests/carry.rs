@@ -107,7 +107,38 @@ fn options() -> CarryOptions {
         force: false,
         title: Some("hero.jpg".into()),
         max_pixels: 100_000_000,
+        soft_binding: None,
     }
+}
+
+fn soft_binding() -> carry::SoftBinding {
+    carry::SoftBinding {
+        algorithm: "com.adobe.trustmark.C".into(),
+        value: "1abcdef012345678".into(),
+    }
+}
+
+fn manifest_assertions(bytes: &[u8], mime: &str) -> Vec<Value> {
+    let report = verifier()
+        .verify(
+            bytes,
+            mime,
+            &Options {
+                include_raw: true,
+                ..Options::default()
+            },
+        )
+        .expect("a report");
+    let store = report.raw_manifest_store.expect("raw store");
+    let active = store["active_manifest"]
+        .as_str()
+        .expect("active")
+        .to_string();
+
+    store["manifests"][&active]["assertions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn actions(report: &c2pa_check_core::Report) -> Vec<String> {
@@ -840,4 +871,123 @@ fn a_carried_file_reports_the_source_category_of_its_original() {
         Some(AI_SOURCE)
     );
     assert!(report.source.inherited);
+}
+
+#[test]
+fn a_soft_binding_is_written_into_the_carried_manifest_and_it_still_validates() {
+    let (source, image) = generated();
+    let identity = generate_identity("Carry Test").expect("identity");
+    let signer = local_signer(&identity.chain_pem, &identity.key_pem, None).expect("signer");
+    let binding = soft_binding();
+
+    let outcome = carry::carry(
+        &source,
+        "image/png",
+        &jpeg(&image),
+        "image/jpeg",
+        signer.as_ref(),
+        &CarryOptions {
+            soft_binding: Some(binding.clone()),
+            ..options()
+        },
+    )
+    .expect("carried");
+
+    let report = verifier()
+        .verify(&outcome.bytes, "image/jpeg", &Options::default())
+        .expect("a report");
+    assert_eq!(report.credential.status, CredentialStatus::ValidUntrusted);
+    let assertions = manifest_assertions(&outcome.bytes, "image/jpeg");
+    let found = assertions
+        .iter()
+        .find(|a| {
+            a["label"]
+                .as_str()
+                .is_some_and(|l| l.starts_with(carry::SOFT_BINDING_LABEL))
+        })
+        .expect("a soft-binding assertion");
+    assert_eq!(found["data"]["alg"], binding.algorithm.as_str());
+    assert_eq!(found["data"]["blocks"][0]["value"], binding.value.as_str());
+}
+
+#[test]
+fn a_hosted_carry_with_a_soft_binding_passes_the_policy() {
+    let (source, image) = generated();
+    let identity = generate_identity("acme.example via c2pa.design").expect("identity");
+    let placeholder = new_placeholder().expect("placeholder");
+    let signer = DeferredSigner::new(
+        pem_chain_to_der(&identity.chain_pem).expect("chain"),
+        placeholder,
+    );
+    let outcome = carry::carry(
+        &source,
+        "image/png",
+        &jpeg(&image),
+        "image/jpeg",
+        &signer,
+        &CarryOptions {
+            soft_binding: Some(soft_binding()),
+            ..options()
+        },
+    )
+    .expect("pending carry");
+    let job = Hosted {
+        identity,
+        placeholder,
+        tbs: signer.take_tbs().expect("tbs captured"),
+        pending: outcome.bytes,
+    };
+
+    let result = check(&source, &job, &job.signature());
+
+    assert!(result.accepted, "{} {}", result.rule, result.detail);
+}
+
+#[test]
+fn a_watermarked_output_is_recognised_as_made_from_its_unmarked_file() {
+    let (source, image) = generated();
+    let identity = generate_identity("Carry Test").expect("identity");
+    let signer = local_signer(&identity.chain_pem, &identity.key_pem, None).expect("signer");
+    let mut marked = image.to_rgb8();
+    for pixel in marked.pixels_mut().step_by(7) {
+        pixel.0[0] = pixel.0[0].saturating_add(2);
+    }
+    let marked = jpeg(&DynamicImage::ImageRgb8(marked));
+    let carried = |binding: Option<carry::SoftBinding>| {
+        carry::carry(
+            &source,
+            "image/png",
+            &marked,
+            "image/jpeg",
+            signer.as_ref(),
+            &CarryOptions {
+                soft_binding: binding,
+                ..options()
+            },
+        )
+        .expect("carried")
+        .bytes
+    };
+    let unmarked = jpeg(&image);
+    let other = jpeg(&scene(800, 600, 2.0));
+    let max = Options::default().max_pixels;
+
+    let with_binding = carried(Some(soft_binding()));
+    let without_binding = carried(None);
+
+    assert!(carry::watermarked_from(
+        (&with_binding, "image/jpeg"),
+        (&unmarked, "image/jpeg"),
+        max
+    ));
+    assert!(!carry::watermarked_from(
+        (&without_binding, "image/jpeg"),
+        (&unmarked, "image/jpeg"),
+        max
+    ));
+    assert!(!carry::watermarked_from(
+        (&with_binding, "image/jpeg"),
+        (&other, "image/jpeg"),
+        max
+    ));
 }

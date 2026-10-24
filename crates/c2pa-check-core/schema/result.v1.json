@@ -185,6 +185,21 @@
         "ai_system_used": { "type": ["string", "null"] }
       }
     },
+    "watermarks": {
+      "description": "Invisible watermarks the engine decoded from the pixels (Adobe TrustMark on JPEG, PNG and WebP). Engine only: the browser analyzer and the CLI never set it. Absent when none was found. Never changes credential.status: anyone can embed any payload.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["algorithm", "payload", "encoding"],
+        "additionalProperties": false,
+        "properties": {
+          "algorithm": { "description": "Algorithm id on the C2PA soft-binding list, e.g. com.adobe.trustmark.C.", "type": "string" },
+          "payload": { "description": "Hex of the decoded bits, left-padded to whole nibbles.", "type": "string", "pattern": "^[0-9a-f]+$" },
+          "encoding": { "description": "bch_5: a 61-bit identifier. bch_super: a 40-bit signpost naming another soft-binding algorithm.", "enum": ["bch_5", "bch_super"] },
+          "signpost": { "description": "Added by the c2pa.design API: the soft-binding algorithm a bch_super payload names.", "type": "string" }
+        }
+      }
+    },
     "raw_manifest_store": { "type": "object" }
   },
   "$defs": {

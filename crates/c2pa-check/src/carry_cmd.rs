@@ -91,6 +91,11 @@ pub struct CarryArgs {
         help = "sign as an edit of the source: with --from when the output is not the same picture, with --compose instead of c2pa.created"
     )]
     edited: bool,
+    #[arg(
+        long,
+        help = "also embed an invisible TrustMark watermark with an identifier issued by c2pa.design, so a copy that loses its credential can be traced back (needs C2PA_API_KEY)"
+    )]
+    watermark: bool,
     #[arg(long, help = "print one JSON document")]
     json: bool,
     #[arg(
@@ -157,6 +162,8 @@ struct Item {
     actions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     carry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watermark_id: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
     #[serde(skip)]
@@ -169,6 +176,7 @@ struct Run<'a> {
     tsa: Option<String>,
     force: bool,
     edited: bool,
+    watermark: bool,
     local: Mutex<Option<LocalIdentity>>,
     identity_note: Mutex<Option<String>>,
     chain: Mutex<Option<Certificate>>,
@@ -177,12 +185,21 @@ struct Run<'a> {
 
 pub fn run(args: CarryArgs, verifier: &Verifier, project: Option<String>) -> anyhow::Result<u8> {
     let (mode, warnings) = mode_from_env(project);
+    if args.watermark && !matches!(mode, Mode::Hosted { .. }) {
+        anyhow::bail!(
+            "--watermark needs C2PA_API_KEY: the identifier is issued and embedded by c2pa.design"
+        );
+    }
+    if args.watermark && !args.compose.is_empty() {
+        anyhow::bail!("--watermark applies to --from/--to carries, not to --compose");
+    }
     let context = Run {
         verifier,
         mode,
         tsa: env::value("C2PA_TSA_URL"),
         force: args.force,
         edited: args.edited,
+        watermark: args.watermark,
         local: Mutex::new(None),
         identity_note: Mutex::new(None),
         chain: Mutex::new(None),
@@ -510,11 +527,19 @@ fn output_is_current(
 
     let current = valid
         && !upgrade
-        && carry::same_pixels(
-            (&signed, mime),
-            (output.unsigned, output.mime),
-            Options::default().max_pixels,
-        );
+        && if context.watermark {
+            carry::watermarked_from(
+                (&signed, mime),
+                (output.unsigned, output.mime),
+                Options::default().max_pixels,
+            )
+        } else {
+            carry::same_pixels(
+                (&signed, mime),
+                (output.unsigned, output.mime),
+                Options::default().max_pixels,
+            )
+        };
     if current {
         item.status = "skipped";
         item.out = Some(output.out.display().to_string());
@@ -715,39 +740,52 @@ fn carry_inner(
     item: &mut Item,
 ) -> Result<(), Failure> {
     let source = read_media(source_path)?;
-    let derived = read_media(derived_path)?;
-    let pair = Pair {
-        source: &source,
-        source_mime: mime_from_extension(&source_path.to_string_lossy()),
-        derived: &derived,
-        derived_mime: mime_from_extension(&derived_path.to_string_lossy()),
-    };
+    let converted = read_media(derived_path)?;
+    let source_mime = mime_from_extension(&source_path.to_string_lossy());
+    let derived_mime = mime_from_extension(&derived_path.to_string_lossy());
 
-    carry::require_credential(pair.source, pair.source_mime)?;
+    carry::require_credential(&source, source_mime)?;
 
-    if carry::already_carried(
-        pair.source,
-        pair.source_mime,
-        pair.derived,
-        pair.derived_mime,
-    ) {
+    if carry::already_carried(&source, source_mime, &converted, derived_mime) {
         item.status = "skipped";
         return Ok(());
     }
+    let unsigned = Output {
+        unsigned: &converted,
+        mime: derived_mime,
+        to: derived_path,
+        out: out_path,
+    };
+    if output_is_current(context, &unsigned, &[(&source, source_mime)], item) {
+        return Ok(());
+    }
+
+    let (derived, soft_binding) = match (&context.mode, context.watermark) {
+        (Mode::Hosted { base, key, .. }, true) => {
+            let (marked, binding) = embed_watermark(base, key, &converted, derived_mime)?;
+            item.watermark_id = Some(binding.value.clone());
+            (marked, Some(binding))
+        }
+        _ => (converted, None),
+    };
+    let pair = Pair {
+        source: &source,
+        source_mime,
+        derived: &derived,
+        derived_mime,
+    };
     let output = Output {
         unsigned: pair.derived,
         mime: pair.derived_mime,
         to: derived_path,
         out: out_path,
     };
-    if output_is_current(context, &output, &[(pair.source, pair.source_mime)], item) {
-        return Ok(());
-    }
 
     let options = CarryOptions {
         force: context.force,
         title: file_title(derived_path),
         max_pixels: Options::default().max_pixels,
+        soft_binding,
     };
 
     let outcome = match sign_pair(context, &pair, &options, item) {
@@ -995,6 +1033,7 @@ fn hosted(
         bytes: &outcome.bytes,
         mime: pair.derived_mime,
         signer_name,
+        watermark_id: options.soft_binding.as_ref().map(|b| b.value.as_str()),
     };
     let bytes = countersign(endpoint, &signer, &pending, item)?;
 
@@ -1023,6 +1062,7 @@ fn hosted_compose(
         bytes: &outcome.bytes,
         mime: work.output_mime,
         signer_name,
+        watermark_id: None,
     };
     let bytes = countersign(endpoint, &signer, &pending, item)?;
 
@@ -1034,6 +1074,7 @@ struct Pending<'a> {
     bytes: &'a [u8],
     mime: &'a str,
     signer_name: Option<String>,
+    watermark_id: Option<&'a str>,
 }
 
 fn countersign(
@@ -1083,6 +1124,9 @@ fn countersign(
     );
     if let Some(project) = endpoint.project {
         part(&mut body, &boundary, "project_id", None, project.as_bytes());
+    }
+    if let Some(id) = pending.watermark_id {
+        part(&mut body, &boundary, "watermark_id", None, id.as_bytes());
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
@@ -1185,6 +1229,83 @@ fn boundary() -> anyhow::Result<String> {
     let mut random = [0u8; BOUNDARY_BYTES];
     getrandom::fill(&mut random).map_err(|e| anyhow!("no random source: {e}"))?;
     Ok(format!("c2pa-check-{}", hex::encode(random)))
+}
+
+const WATERMARK_MEDIA: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
+const MAX_WATERMARKED_BYTES: u64 = 64 << 20;
+
+fn embed_watermark(
+    base: &str,
+    key: &str,
+    image: &[u8],
+    mime: &str,
+) -> Result<(Vec<u8>, carry::SoftBinding), Failure> {
+    if !WATERMARK_MEDIA.contains(&mime) {
+        return Err(Failure::Refused(
+            Some("watermark_unsupported".into()),
+            format!("{mime} cannot carry a watermark; only JPEG, PNG and WebP can"),
+        ));
+    }
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut response = agent
+        .post(&format!("{}/assets/watermark", base.trim_end_matches('/')))
+        .header("Authorization", &format!("Bearer {key}"))
+        .header("Content-Type", "application/octet-stream")
+        .header("X-Media-Type", mime)
+        .header(
+            "User-Agent",
+            &format!("c2pa-check/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .send(image)
+        .map_err(|err| Failure::Error(anyhow!("watermark: {}", network_reason(&err))))?;
+
+    let status = response.status().as_u16();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (id, algorithm) = (header("x-watermark-id"), header("x-watermark-algorithm"));
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_WATERMARKED_BYTES)
+        .read_to_vec()
+        .map_err(|err| Failure::Error(anyhow!("watermark: {err}")))?;
+    if !(200..300).contains(&status) {
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let code = value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("watermark_failed");
+        return Err(Failure::Error(anyhow!(
+            "watermark: c2pa.design answered {status} ({code})"
+        )));
+    }
+
+    match (id, algorithm) {
+        (Some(id), Some(algorithm))
+            if !bytes.is_empty() && !id.is_empty() && !algorithm.is_empty() =>
+        {
+            Ok((
+                bytes,
+                carry::SoftBinding {
+                    algorithm,
+                    value: id,
+                },
+            ))
+        }
+        _ => Err(Failure::Error(anyhow!(
+            "watermark: the response had no identifier"
+        ))),
+    }
 }
 
 fn call(url: &str, key: &str, content_type: &str, body: &[u8]) -> Result<Value, Hosted> {
@@ -1725,6 +1846,7 @@ mod tests {
             tsa: None,
             force: false,
             edited: false,
+            watermark: false,
             local: Mutex::new(None),
             identity_note: Mutex::new(None),
             chain: Mutex::new(None),
@@ -2331,6 +2453,7 @@ mod tests {
             tsa: None,
             force: false,
             edited: false,
+            watermark: false,
             local: Mutex::new(None),
             identity_note: Mutex::new(None),
             chain: Mutex::new(None),
@@ -2526,6 +2649,7 @@ mod tests {
             tsa: None,
             force: false,
             edited: false,
+            watermark: false,
             local: Mutex::new(None),
             identity_note: Mutex::new(None),
             chain: Mutex::new(None),
@@ -2842,5 +2966,71 @@ mod tests {
         assert_eq!(value["source"], "hero.png");
         assert_eq!(value["output"], "hero.webp");
         assert_eq!(exit_code(&items, false), 5);
+    }
+
+    #[test]
+    fn a_watermark_is_embedded_by_the_api_and_returned_as_a_soft_binding() {
+        let (base, server) = crate::test_server::serve_raw(1, |request| {
+            assert!(request.path.ends_with("/assets/watermark"));
+            assert_eq!(request.authorization, "Bearer c2pa_test_key");
+            (
+                200,
+                "Content-Type: application/octet-stream\r\nX-Watermark-Id: 1abcdef012345678\r\nX-Watermark-Algorithm: com.adobe.trustmark.C\r\n".into(),
+                [b"marked:".as_slice(), &request.body].concat(),
+            )
+        });
+
+        let Ok((bytes, binding)) = embed_watermark(&base, "c2pa_test_key", b"png", "image/png")
+        else {
+            panic!("the watermark was not embedded");
+        };
+
+        assert_eq!(bytes, b"marked:png");
+        assert_eq!(binding.algorithm, "com.adobe.trustmark.C");
+        assert_eq!(binding.value, "1abcdef012345678");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_watermark_refusal_or_a_missing_identifier_is_an_error() {
+        let (base, server) = crate::test_server::serve_raw(2, |request| {
+            if request.body == b"refuse" {
+                (
+                    415,
+                    "Content-Type: application/json\r\n".into(),
+                    br#"{"error":{"code":"watermark_unsupported"}}"#.to_vec(),
+                )
+            } else {
+                (
+                    200,
+                    "Content-Type: application/octet-stream\r\n".into(),
+                    b"marked".to_vec(),
+                )
+            }
+        });
+
+        let refused = embed_watermark(&base, "k", b"refuse", "image/png");
+        let missing = embed_watermark(&base, "k", b"plain", "image/png");
+
+        assert!(failure_text(refused).contains("415"));
+        assert!(failure_text(missing).contains("no identifier"));
+        server.join().unwrap();
+    }
+
+    fn failure_text<T>(result: Result<T, Failure>) -> String {
+        match result {
+            Ok(_) => panic!("the request should have failed"),
+            Err(Failure::Refused(_, message)) => message,
+            Err(Failure::Error(err)) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_type_that_cannot_carry_a_watermark_is_refused_before_any_request() {
+        let failure = embed_watermark("http://127.0.0.1:9", "k", b"gif", "image/gif");
+
+        assert!(
+            matches!(failure, Err(Failure::Refused(Some(rule), _)) if rule == "watermark_unsupported")
+        );
     }
 }
