@@ -19,6 +19,12 @@ pub struct Metadata {
     pub fields: Vec<String>,
     pub digital_source_type: Option<String>,
     pub ai_system_used: Option<String>,
+    #[serde(default)]
+    pub captured_at: Option<String>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub anomalies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -138,11 +144,30 @@ const EXIF_FIELDS: &[(u16, Field)] = &[
     (0x013B, Field::Creator),
     (0x8298, Field::Copyright),
     (0x010E, Field::CaptionDescription),
-    (0x9003, Field::DateCreated),
+    (TAG_ORIGINAL, Field::DateCreated),
 ];
 
 const TAG_EXIF_IFD: u16 = 0x8769;
 const TAG_IPTC: u16 = 0x83BB;
+const TAG_MAKE: u16 = 0x010F;
+const TAG_MODEL: u16 = 0x0110;
+const TAG_MODIFIED: u16 = 0x0132;
+const TAG_ORIGINAL: u16 = 0x9003;
+const TAG_DIGITIZED: u16 = 0x9004;
+const TAG_OFFSET_MODIFIED: u16 = 0x9010;
+const TAG_OFFSET_ORIGINAL: u16 = 0x9011;
+const TAG_OFFSET_DIGITIZED: u16 = 0x9012;
+
+const XMP_CREATE_DATE: &str = "xmp:CreateDate";
+const XMP_MODIFY_DATE: &str = "xmp:ModifyDate";
+const XMP_DATE_CREATED: &str = "photoshop:DateCreated";
+
+const CAPTURE_DATES_TOLERANCE: i64 = 36 * 3600;
+
+pub const ANOMALY_MODIFIED_BEFORE_CAPTURE: &str = "modified_before_capture";
+pub const ANOMALY_DIGITIZED_BEFORE_CAPTURE: &str = "digitized_before_capture";
+pub const ANOMALY_XMP_MODIFIED_BEFORE_CREATED: &str = "xmp_modified_before_created";
+pub const ANOMALY_CAPTURE_DATES_DISAGREE: &str = "capture_dates_disagree";
 
 const IGNORED_ATTRIBUTES: &[&str] = &["rdf:parseType", "xml:lang", "rdf:about", "x:xmptk"];
 
@@ -151,9 +176,242 @@ struct Found {
     fields: BTreeSet<Field>,
     digital_source_type: Option<String>,
     ai_system_used: Option<String>,
+    exif: ExifDates,
+    make: Option<String>,
+    model: Option<String>,
+    xmp_created: Option<Stamp>,
+    xmp_modified: Option<Stamp>,
+    xmp_date_created: Option<Stamp>,
+}
+
+#[derive(Debug, Default)]
+struct ExifDates {
+    modified: Option<Stamp>,
+    original: Option<Stamp>,
+    digitized: Option<Stamp>,
+    offset_modified: Option<i64>,
+    offset_original: Option<i64>,
+    offset_digitized: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    seconds: i64,
+    zoned: bool,
+    timed: bool,
+}
+
+impl Stamp {
+    fn parse(text: &str) -> Option<Self> {
+        let b = text.trim().as_bytes();
+        let num = |from: usize, len: usize| -> Option<i64> {
+            let part = b.get(from..from + len)?;
+            if !part.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            std::str::from_utf8(part).ok()?.parse().ok()
+        };
+        let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+        if !matches!(b.get(4), Some(b':' | b'-')) || b.get(7) != b.get(4) {
+            return None;
+        }
+        if year == 0 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return None;
+        }
+        let (mut hour, mut minute, mut second, mut at) = (0, 0, 0, 10);
+        let timed = matches!(b.get(10), Some(b' ' | b'T'));
+        if timed {
+            hour = num(11, 2)?;
+            minute = num(14, 2)?;
+            at = 16;
+            if b.get(16) == Some(&b':') {
+                second = num(17, 2)?;
+                at = 19;
+            }
+        }
+        if hour > 23 || minute > 59 || second > 60 {
+            return None;
+        }
+        if b.get(at) == Some(&b'.') {
+            at += 1;
+            while b.get(at).is_some_and(u8::is_ascii_digit) {
+                at += 1;
+            }
+        }
+        let offset = b
+            .get(at..)
+            .and_then(|rest| parse_offset(std::str::from_utf8(rest).ok()?));
+        let days = crate::calendar::days_from_civil(year, month as u32, day as u32);
+        let local = days * 86_400 + hour * 3600 + minute * 60 + second;
+
+        Some(Self {
+            seconds: local - offset.unwrap_or(0),
+            zoned: offset.is_some(),
+            timed,
+        })
+    }
+
+    fn shifted(self, offset: Option<i64>) -> Self {
+        match offset {
+            Some(o) if !self.zoned => Self {
+                seconds: self.seconds - o,
+                zoned: true,
+                ..self
+            },
+            _ => self,
+        }
+    }
+
+    fn before(self, other: Self) -> bool {
+        self.zoned == other.zoned && self.seconds < other.seconds
+    }
+
+    fn iso(self) -> String {
+        let days = self.seconds.div_euclid(86_400);
+        let rest = self.seconds.rem_euclid(86_400);
+        if !self.timed {
+            return crate::calendar::iso_date(days);
+        }
+
+        format!(
+            "{}T{:02}:{:02}:{:02}",
+            crate::calendar::iso_date(days),
+            rest / 3600,
+            rest % 3600 / 60,
+            rest % 60
+        )
+    }
+}
+
+fn parse_offset(text: &str) -> Option<i64> {
+    let text = text.trim().trim_end_matches('\0');
+    if text == "Z" {
+        return Some(0);
+    }
+    let b = text.as_bytes();
+    let sign = match b.first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    if b.len() != 6 || b[3] != b':' || ![1, 2, 4, 5].iter().all(|&i| b[i].is_ascii_digit()) {
+        return None;
+    }
+    let hours: i64 = text.get(1..3)?.parse().ok()?;
+    let minutes: i64 = text.get(4..6)?.parse().ok()?;
+    if hours > 14 || minutes > 59 {
+        return None;
+    }
+
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+fn exif_before(
+    a: Option<Stamp>,
+    a_offset: Option<i64>,
+    b: Option<Stamp>,
+    b_offset: Option<i64>,
+) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return false;
+    };
+    if a_offset.is_some() && b_offset.is_some() {
+        return a.shifted(a_offset).before(b.shifted(b_offset));
+    }
+
+    a.before(b)
+}
+
+fn exif_text(data: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(data);
+    let text = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+
+    (!text.is_empty()).then(|| bounded(text))
+}
+
+fn device(make: Option<&str>, model: Option<&str>) -> Option<String> {
+    match (make, model) {
+        (Some(make), Some(model)) if model.to_lowercase().starts_with(&make.to_lowercase()) => {
+            Some(model.to_string())
+        }
+        (Some(make), Some(model)) => Some(format!("{make} {model}")),
+        (Some(one), None) | (None, Some(one)) => Some(one.to_string()),
+        (None, None) => None,
+    }
 }
 
 impl Found {
+    fn note_exif(&mut self, tag: u16, data: &[u8]) {
+        let Some(text) = exif_text(data) else {
+            return;
+        };
+        let exif = &mut self.exif;
+        match tag {
+            TAG_MAKE if self.make.is_none() => self.make = Some(text),
+            TAG_MODEL if self.model.is_none() => self.model = Some(text),
+            TAG_MODIFIED => exif.modified = exif.modified.or(Stamp::parse(&text)),
+            TAG_ORIGINAL => exif.original = exif.original.or(Stamp::parse(&text)),
+            TAG_DIGITIZED => exif.digitized = exif.digitized.or(Stamp::parse(&text)),
+            TAG_OFFSET_MODIFIED => {
+                exif.offset_modified = exif.offset_modified.or(parse_offset(&text))
+            }
+            TAG_OFFSET_ORIGINAL => {
+                exif.offset_original = exif.offset_original.or(parse_offset(&text))
+            }
+            TAG_OFFSET_DIGITIZED => {
+                exif.offset_digitized = exif.offset_digitized.or(parse_offset(&text))
+            }
+            _ => {}
+        }
+    }
+
+    fn note_xmp(&mut self, name: &str, value: &str) {
+        let slot = match name {
+            XMP_CREATE_DATE => &mut self.xmp_created,
+            XMP_MODIFY_DATE => &mut self.xmp_modified,
+            XMP_DATE_CREATED => &mut self.xmp_date_created,
+            _ => return,
+        };
+        if slot.is_none() {
+            *slot = Stamp::parse(value);
+        }
+    }
+
+    fn anomalies(&self) -> Vec<String> {
+        let exif = &self.exif;
+        let mut out = Vec::new();
+
+        if exif_before(
+            exif.modified,
+            exif.offset_modified,
+            exif.original,
+            exif.offset_original,
+        ) {
+            out.push(ANOMALY_MODIFIED_BEFORE_CAPTURE);
+        }
+        if exif_before(
+            exif.digitized,
+            exif.offset_digitized,
+            exif.original,
+            exif.offset_original,
+        ) {
+            out.push(ANOMALY_DIGITIZED_BEFORE_CAPTURE);
+        }
+        if let (Some(m), Some(c)) = (self.xmp_modified, self.xmp_created) {
+            if m.before(c) {
+                out.push(ANOMALY_XMP_MODIFIED_BEFORE_CREATED);
+            }
+        }
+        if let (Some(o), Some(x)) = (exif.original, self.xmp_date_created) {
+            if (o.seconds - x.seconds).abs() > CAPTURE_DATES_TOLERANCE {
+                out.push(ANOMALY_CAPTURE_DATES_DISAGREE);
+            }
+        }
+        out.sort_unstable();
+
+        out.into_iter().map(str::to_string).collect()
+    }
+
     fn mark(&mut self, field: Field, value: &str) {
         self.fields.insert(field);
         let slot = match field {
@@ -169,11 +427,17 @@ impl Found {
     fn into_metadata(self) -> Metadata {
         let score = self.fields.iter().filter(|f| f.scored()).count() * 25;
 
+        let anomalies = self.anomalies();
+        let captured_at = self.exif.original.or(self.xmp_date_created).map(Stamp::iso);
+
         Metadata {
             four_cs_score: u8::try_from(score).unwrap_or(100),
             fields: self.fields.iter().map(|f| f.name().to_string()).collect(),
             digital_source_type: self.digital_source_type.map(|v| last_segment(&v)),
             ai_system_used: self.ai_system_used,
+            captured_at,
+            device: device(self.make.as_deref(), self.model.as_deref()),
+            anomalies,
         }
     }
 }
@@ -552,6 +816,11 @@ fn scan_tiff(bytes: &[u8], found: &mut Found) {
 }
 
 fn mark_exif(tiff: &Tiff<'_>, tag: u16, kind: u16, count: u32, entry: usize, found: &mut Found) {
+    if kind == 2 {
+        if let Some(data) = tiff.value(kind, count, entry) {
+            found.note_exif(tag, data);
+        }
+    }
     let Some((_, field)) = EXIF_FIELDS.iter().find(|(id, _)| *id == tag) else {
         return;
     };
@@ -766,6 +1035,7 @@ fn scan_xmp(packet: &str, found: &mut Found) {
                     if ignored_attribute(key) || value.trim().is_empty() {
                         continue;
                     }
+                    found.note_xmp(key, value);
                     if let Some(field) = xmp_field(key) {
                         found.mark(field, value);
                     }
@@ -791,6 +1061,9 @@ fn scan_xmp(packet: &str, found: &mut Found) {
             Token::Text(text) => {
                 if text.trim().is_empty() {
                     continue;
+                }
+                if let Some((name, _)) = stack.last() {
+                    found.note_xmp(name, text);
                 }
                 for field in stack.iter().filter_map(|(_, f)| *f) {
                     found.mark(field, text);
@@ -1183,5 +1456,168 @@ mod tests {
         fields.dedup();
 
         assert_eq!(fields.iter().map(|f| f.name()).collect::<Vec<_>>(), names);
+    }
+
+    fn exif_jpeg(ifd0: &[(u16, &str)], exif: &[(u16, &str)]) -> Vec<u8> {
+        let mut payload = EXIF_PREFIX.to_vec();
+        payload.extend_from_slice(&tiff_le(ifd0, exif));
+        jpeg_with(&[(0xE1, payload)])
+    }
+
+    fn xmp_jpeg(body: &str) -> Vec<u8> {
+        let packet = format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description {body}/></rdf:RDF></x:xmpmeta>"#
+        );
+        let mut bytes = vec![0xFF, 0xD8];
+        bytes.extend_from_slice(packet.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn capture_time_and_device_are_reported() {
+        let jpeg = exif_jpeg(
+            &[(0x010F, "Canon"), (0x0110, "Canon EOS R6")],
+            &[(0x9003, "2026:03:14 09:21:30")],
+        );
+
+        let meta = extract(&jpeg, "image/jpeg");
+
+        assert_eq!(meta.captured_at.as_deref(), Some("2026-03-14T09:21:30"));
+        assert_eq!(meta.device.as_deref(), Some("Canon EOS R6"));
+        assert!(meta.anomalies.is_empty());
+    }
+
+    #[test]
+    fn make_and_model_join_when_the_model_does_not_repeat_the_make() {
+        assert_eq!(
+            device(Some("Apple"), Some("iPhone 16")).as_deref(),
+            Some("Apple iPhone 16")
+        );
+        assert_eq!(device(None, Some("X100V")).as_deref(), Some("X100V"));
+        assert_eq!(device(None, None), None);
+    }
+
+    #[test]
+    fn a_save_time_before_the_capture_time_is_an_anomaly() {
+        let jpeg = exif_jpeg(
+            &[(0x0132, "2026:03:14 09:00:00")],
+            &[
+                (0x9003, "2026:03:14 09:21:30"),
+                (0x9004, "2026:03:13 09:21:30"),
+            ],
+        );
+
+        let meta = extract(&jpeg, "image/jpeg");
+
+        assert_eq!(
+            meta.anomalies,
+            vec![
+                ANOMALY_DIGITIZED_BEFORE_CAPTURE,
+                ANOMALY_MODIFIED_BEFORE_CAPTURE
+            ]
+        );
+    }
+
+    #[test]
+    fn exif_offsets_are_applied_when_both_times_carry_one() {
+        let jpeg = exif_jpeg(
+            &[(0x0132, "2026:03:14 09:00:00")],
+            &[
+                (0x9003, "2026:03:14 10:00:00"),
+                (0x9010, "-05:00"),
+                (0x9011, "+09:00"),
+            ],
+        );
+
+        let meta = extract(&jpeg, "image/jpeg");
+
+        assert!(meta.anomalies.is_empty());
+    }
+
+    #[test]
+    fn a_later_save_time_is_not_an_anomaly() {
+        let jpeg = exif_jpeg(
+            &[(0x0132, "2026:03:15 09:00:00")],
+            &[(0x9003, "2026:03:14 09:21:30")],
+        );
+
+        assert!(extract(&jpeg, "image/jpeg").anomalies.is_empty());
+    }
+
+    #[test]
+    fn xmp_dates_compare_in_utc_and_only_when_both_are_zoned() {
+        let earlier = xmp_jpeg(
+            r#"xmp:CreateDate="2026-01-01T10:00:00+02:00" xmp:ModifyDate="2026-01-01T07:00:00Z""#,
+        );
+        let later = xmp_jpeg(
+            r#"xmp:CreateDate="2026-01-01T10:00:00+02:00" xmp:ModifyDate="2026-01-01T09:00:00Z""#,
+        );
+        let mixed = xmp_jpeg(
+            r#"xmp:CreateDate="2026-01-01T10:00:00+02:00" xmp:ModifyDate="2026-01-01T07:00:00""#,
+        );
+
+        assert_eq!(
+            extract(&earlier, "image/jpeg").anomalies,
+            vec![ANOMALY_XMP_MODIFIED_BEFORE_CREATED]
+        );
+        assert!(extract(&later, "image/jpeg").anomalies.is_empty());
+        assert!(extract(&mixed, "image/jpeg").anomalies.is_empty());
+    }
+
+    #[test]
+    fn exif_and_xmp_capture_dates_far_apart_are_an_anomaly() {
+        let mut jpeg = exif_jpeg(&[], &[(0x9003, "2026:03:14 09:21:30")]);
+        jpeg.extend_from_slice(
+            br#"<x:xmpmeta><rdf:Description><photoshop:DateCreated>2025-03-14</photoshop:DateCreated></rdf:Description></x:xmpmeta>"#,
+        );
+        let mut near = exif_jpeg(&[], &[(0x9003, "2026:03:14 23:21:30")]);
+        near.extend_from_slice(
+            br#"<x:xmpmeta><rdf:Description><photoshop:DateCreated>2026-03-14T09:00:00+09:00</photoshop:DateCreated></rdf:Description></x:xmpmeta>"#,
+        );
+
+        assert_eq!(
+            extract(&jpeg, "image/jpeg").anomalies,
+            vec![ANOMALY_CAPTURE_DATES_DISAGREE]
+        );
+        assert!(extract(&near, "image/jpeg").anomalies.is_empty());
+    }
+
+    #[test]
+    fn the_xmp_capture_date_is_used_when_exif_has_none() {
+        let jpeg = xmp_jpeg(r#"photoshop:DateCreated="2024-07-01T12:30:00""#);
+
+        assert_eq!(
+            extract(&jpeg, "image/jpeg").captured_at.as_deref(),
+            Some("2024-07-01T12:30:00")
+        );
+    }
+
+    #[test]
+    fn a_date_without_a_time_is_reported_as_a_date() {
+        let jpeg = xmp_jpeg(r#"photoshop:DateCreated="2024-07-01""#);
+
+        assert_eq!(
+            extract(&jpeg, "image/jpeg").captured_at.as_deref(),
+            Some("2024-07-01")
+        );
+    }
+
+    #[test]
+    fn malformed_dates_are_ignored() {
+        for text in [
+            "0000:00:00 00:00:00",
+            "    :  :     :  :  ",
+            "2026:13:01 00:00:00",
+            "2026:01-01 00:00:00",
+            "2026:01:01 25:00:00",
+            "20",
+            "",
+        ] {
+            assert_eq!(Stamp::parse(text), None, "{text:?}");
+        }
+        assert_eq!(parse_offset("+15:00"), None);
+        assert_eq!(parse_offset("+-1:00"), None);
+        assert_eq!(parse_offset("-03:30"), Some(-(3 * 3600 + 30 * 60)));
+        assert_eq!(parse_offset("0900"), None);
     }
 }

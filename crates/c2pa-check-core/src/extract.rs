@@ -43,7 +43,7 @@ pub fn build(
         status: classify::status(true, valid, trusted),
     };
     let signer = signer(active, trusted, selector);
-    let claim = claim(active);
+    let claim = claim(active, active_entry(&store).map(|(label, _)| label));
     let (source, actions) = source_and_actions(&store, active);
     let trusted_manifests = trusted_manifests(&store);
     let origin = origin(
@@ -74,15 +74,22 @@ pub fn build(
 }
 
 fn active_manifest(store: &Value) -> Option<&Value> {
+    active_entry(store).map(|(_, manifest)| manifest)
+}
+
+fn active_entry(store: &Value) -> Option<(&str, &Value)> {
     let manifests = store.get("manifests")?.as_object()?;
 
     if let Some(label) = store.get("active_manifest").and_then(Value::as_str) {
-        if let Some(found) = manifests.get(label) {
-            return Some(found);
+        if let Some((key, found)) = manifests.get_key_value(label) {
+            return Some((key.as_str(), found));
         }
     }
 
-    manifests.values().next()
+    manifests
+        .iter()
+        .next()
+        .map(|(key, found)| (key.as_str(), found))
 }
 
 fn text(value: Option<&Value>) -> Option<String> {
@@ -124,7 +131,7 @@ fn organization_of(subject: &str) -> String {
         .to_string()
 }
 
-fn claim(active: Option<&Value>) -> Option<Claim> {
+fn claim(active: Option<&Value>, label: Option<&str>) -> Option<Claim> {
     let manifest = active?;
     let generator = manifest
         .get("claim_generator_info")
@@ -146,6 +153,7 @@ fn claim(active: Option<&Value>) -> Option<Claim> {
         algorithm: signature
             .and_then(|info| text(info.get("alg")))
             .map(|alg| alg.to_lowercase()),
+        manifest_label: label.filter(|l| !l.is_empty()).map(str::to_string),
     })
 }
 
@@ -482,6 +490,7 @@ fn ingredients(
                 relationship: text(item.get("relationship")),
                 credential_status: status,
                 signer_name: origin.and_then(|(_, found)| signer_name(found)),
+                manifest_label: text(item.get("active_manifest")),
             }
         })
         .collect()
@@ -661,6 +670,57 @@ mod tests {
         assert_eq!(report.credential.status, CredentialStatus::PresentInvalid);
         assert!(report.credential.present);
         assert!(!report.credential.valid);
+    }
+
+    fn labelled(store: Value) -> Report {
+        build(
+            store,
+            engine(),
+            asset(),
+            &Options::default(),
+            TrustSelector::Official,
+        )
+    }
+
+    #[test]
+    fn a_carried_file_names_its_own_label_and_its_parents() {
+        let report = labelled(serde_json::json!({
+            "active_manifest": "urn:c2pa:copy",
+            "validation_state": "Valid",
+            "manifests": {
+                "urn:c2pa:copy": {"ingredients": [
+                    {"title": "source.png", "relationship": "parentOf", "active_manifest": "urn:c2pa:source"}
+                ]},
+                "urn:c2pa:source": {"ingredients": []}
+            }
+        }));
+
+        assert_eq!(
+            report.claim.and_then(|c| c.manifest_label).as_deref(),
+            Some("urn:c2pa:copy")
+        );
+        assert_eq!(
+            report.ingredients[0].manifest_label.as_deref(),
+            Some("urn:c2pa:source")
+        );
+    }
+
+    #[test]
+    fn an_ingredient_without_a_manifest_has_no_label() {
+        let report = report("Valid");
+
+        assert_eq!(report.ingredients.len(), 1);
+        assert!(report.ingredients[0].manifest_label.is_none());
+        let json = serde_json::to_value(&report.ingredients[0]).unwrap();
+        assert!(json.get("manifest_label").is_none());
+    }
+
+    #[test]
+    fn a_store_without_a_manifest_has_neither_label() {
+        let report = labelled(serde_json::json!({"validation_state": "Valid", "manifests": {}}));
+
+        assert!(report.claim.is_none());
+        assert!(report.ingredients.is_empty());
     }
 
     const AI_GENERATED: &str =

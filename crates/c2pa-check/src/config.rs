@@ -25,6 +25,15 @@ pub struct Config {
     pub monitors: Vec<Value>,
     #[serde(default)]
     pub domains: Vec<String>,
+    #[serde(default)]
+    pub serve: Option<Vec<Serve>>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Serve {
+    pub path: String,
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize)]

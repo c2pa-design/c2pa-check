@@ -197,6 +197,8 @@ pub struct Claim {
     pub timestamp_authority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub algorithm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +239,8 @@ pub struct Ingredient {
     pub credential_status: Option<CredentialStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -419,6 +423,9 @@ mod tests {
             fields: vec!["Creator".into()],
             digital_source_type: None,
             ai_system_used: None,
+            captured_at: None,
+            device: None,
+            anomalies: Vec::new(),
         };
 
         let value = serde_json::to_value(&metadata).expect("serializable metadata");
@@ -427,5 +434,7 @@ mod tests {
         assert_eq!(value["fields"][0], "Creator");
         assert!(value["digital_source_type"].is_null());
         assert!(value.as_object().unwrap().contains_key("ai_system_used"));
+        assert!(value["captured_at"].is_null());
+        assert_eq!(value["anomalies"], serde_json::json!([]));
     }
 }

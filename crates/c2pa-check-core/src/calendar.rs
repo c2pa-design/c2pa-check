@@ -32,6 +32,17 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+
+    era * 146_097 + day_of_era - 719_468
+}
+
 pub fn iso_date(days: i64) -> String {
     let (year, month, day) = civil_from_days(days);
 
@@ -92,6 +103,14 @@ mod tests {
             assert!((1..=12).contains(&current.1));
             assert!((1..=31).contains(&current.2));
             previous = current;
+        }
+    }
+
+    #[test]
+    fn days_from_civil_inverts_civil_from_days() {
+        for days in -800_000..800_000i64 {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(days_from_civil(year, month, day), days);
         }
     }
 

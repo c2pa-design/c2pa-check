@@ -54,7 +54,11 @@
         "spec_version": { "type": "string" },
         "signed_at": { "type": "string" },
         "timestamp_authority": { "type": "string" },
-        "algorithm": { "type": "string" }
+        "algorithm": { "type": "string" },
+        "manifest_label": {
+          "description": "Label of the active manifest (urn:c2pa:… or urn:uuid:…). Absent when there is no manifest.",
+          "type": "string"
+        }
       }
     },
     "source": {
@@ -88,6 +92,10 @@
           "credential_status": { "$ref": "#/$defs/credentialStatus" },
           "signer_name": {
             "description": "Organization, else common name, of the certificate that signed the ingredient's manifest. Absent when the manifest is not in the store.",
+            "type": "string"
+          },
+          "manifest_label": {
+            "description": "Label of the ingredient's own active manifest. Absent for an ingredient that carries no manifest.",
             "type": "string"
           }
         }
@@ -182,7 +190,21 @@
           "description": "Last path segment of Iptc4xmpExt:DigitalSourceType from XMP.",
           "type": ["string", "null"]
         },
-        "ai_system_used": { "type": ["string", "null"] }
+        "ai_system_used": { "type": ["string", "null"] },
+        "captured_at": {
+          "description": "Capture time the file declares: Exif DateTimeOriginal, else XMP photoshop:DateCreated, as YYYY-MM-DDTHH:MM:SS, or YYYY-MM-DD when the file declares a date only. Exif clock time without its offset; an XMP value with an offset is converted to UTC. Declared, not proven.",
+          "type": ["string", "null"]
+        },
+        "device": {
+          "description": "Exif Make and Model joined; the model alone when it already starts with the make.",
+          "type": ["string", "null"]
+        },
+        "anomalies": {
+          "description": "Contradictions between the dates the file declares about itself. Facts about the metadata, never a finding about the content.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["capture_dates_disagree", "digitized_before_capture", "modified_before_capture", "xmp_modified_before_created"] }
+        }
       }
     },
     "watermarks": {

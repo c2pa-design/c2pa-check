@@ -42,6 +42,7 @@ pub fn run(args: &ApplyArgs, config: &Config) -> anyhow::Result<u8> {
     webhooks(&api, args, config)?;
     monitors(&api, config)?;
     let pending = domains(&api, config, Duration::from_secs(args.wait))?;
+    serving(&api, config)?;
 
     Ok(if pending && args.wait > 0 {
         EXIT_PENDING
@@ -220,6 +221,29 @@ fn domains(api: &Api, config: &Config, wait: Duration) -> anyhow::Result<bool> {
     Ok(!pending.is_empty())
 }
 
+fn serving(api: &Api, config: &Config) -> anyhow::Result<()> {
+    let Some(rules) = &config.serve else {
+        return Ok(());
+    };
+
+    let answer = api.call(
+        "PUT",
+        "/serving",
+        Some(&api.scoped(json!({ "rules": rules }))?),
+    )?;
+    println!(
+        "serving  {} folder(s), {} served URL(s) queued for a first check",
+        items_of(&answer, "rules"),
+        answer["queued"].as_u64().unwrap_or_default()
+    );
+
+    Ok(())
+}
+
+fn items_of(answer: &Value, field: &str) -> usize {
+    answer[field].as_array().map_or(0, Vec::len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +324,42 @@ mod tests {
         let put: Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert_eq!(put["secret"], reused);
         assert_eq!(put["events"], json!(["asset.lost"]));
+    }
+
+    #[test]
+    fn serve_rules_are_sent_with_the_project_and_an_absent_list_sends_nothing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (base, server) = serve(1, move |request| {
+            tx.send(serde_json::from_slice::<Value>(&request.body).unwrap())
+                .unwrap();
+            (200, r#"{"project_id":"p1","rules":[{"path":"public/","url":"https://e.com/"}],"queued":3}"#.to_string())
+        });
+        let api = Api::new(base, "k".into())
+            .without_waiting()
+            .with_project_id(Some("p1"));
+        let with_rules: Config =
+            serde_json::from_str(r#"{"serve":[{"path":"public/","url":"https://e.com/"}]}"#)
+                .unwrap();
+
+        serving(&api, &with_rules).unwrap();
+        serving(&api, &Config::default()).unwrap();
+
+        assert_eq!(server.join().unwrap(), ["/v1/serving"]);
+        let body = rx.recv().unwrap();
+        assert_eq!(body["project_id"], "p1");
+        assert_eq!(
+            body["rules"],
+            json!([{"path":"public/","url":"https://e.com/"}])
+        );
+    }
+
+    #[test]
+    fn a_serve_rule_with_an_unknown_field_is_refused() {
+        let parsed: Result<Config, _> = serde_json::from_str(
+            r#"{"serve":[{"path":"public/","url":"https://e.com/","cdn":true}]}"#,
+        );
+
+        assert!(parsed.is_err());
     }
 
     #[test]

@@ -114,7 +114,7 @@ process (the command does not wait for it) and prints what it sends. No file nam
 ## In CI
 
 ```yaml
-- uses: c2pa-design/c2pa-check/action@v0.6.2
+- uses: c2pa-design/c2pa-check/action@v0.6.3
   with:
     paths: "public/**/*.{jpg,png,webp}"
     coverage: 100
@@ -122,13 +122,13 @@ process (the command does not wait for it) and prints what it sends. No file nam
     output: c2pa-check.xml
 ```
 
-The action installs the release named by `version` (default `v0.6.2`) and checks it against the
+The action installs the release named by `version` (default `v0.6.3`) and checks it against the
 release's `SHA256SUMS` before running it. Every release publishes `SHA256SUMS` and a GitHub
 build-provenance attestation (`gh attestation verify c2pa-check-<target>.tar.gz -R
 c2pa-design/c2pa-check`); the npm packages are published with npm provenance
 (`npm audit signatures`).
 
-Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.6.2`
+Outside GitHub Actions, any image with Node.js 18+ runs `npx -y c2pa-check@0.6.3`
 (`node:22-bookworm-slim` is the smallest that also has the glibc tools most pipelines expect;
 the binary itself is static musl, so `node:22-alpine` works too). Pin the version so `npx` hits
 its cache instead of resolving `latest` on every run, and cache `~/.npm` between jobs; or skip
